@@ -1,0 +1,52 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environments
+.venv/
+venv/
+ENV/
+env/
+
+# Data and Artifacts (Never commit raw data or large models)
+data/
+*.csv
+*.xlsx
+*.jsonl
+*.parquet
+*.pkl
+*.pickle
+*.joblib
+*.h5
+*.pth
+*.pt
+*.onnx
+models/
+artifacts/
+
+# Validation and Monitoring Reports
+.evidently/
+html_reports/
+*.html
+.pytest_cache/
+.coverage
+
+# Configuration and Secrets
+.env
+*.local
+credentials.json
+*.pem
+
+# MLOps and Pipelines (DVC / MLflow / Airflow)
+.mlflow/
+mlruns/
+.dvc/cache/
+.dvc/tmp/
+
+# IDEs and OS
+.qodo/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
