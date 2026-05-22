@@ -20,7 +20,7 @@ class StatisticalTestSuite:
         cur_array = np.asarray(current).flatten()
         statistic, pvalue = stats.ks_2samp(ref_array, cur_array, alternative="two-sided")
         # Access as attributes - this satisfies Pylance's type checker
-        return float(statistic), float(pvalue)
+        return float(np.asarray(statistic)), float(np.asarray(pvalue))
 
     @staticmethod
     def psi_numerical(

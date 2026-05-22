@@ -1,8 +1,18 @@
 # src/drift/detector.py
 """
-Production drift detection.
-Fix: NaN handling is now explicit and consistent across all features.
-Events are emitted per-feature so Grafana shows real-time drift heatmap.
+Drift detector — modified to accept ALREADY PROCESSED DataFrames.
+
+Key change:
+  Before: raw DataFrames passed in, dropna() called internally
+  Now:    processed DataFrames passed in (both in same feature space)
+          No dropna() needed — processor already handled nulls
+          Feature columns auto-detected from processed DataFrame
+
+Why this gives better drift results:
+  Both DataFrames are in the SAME sklearn-transformed feature space.
+  KS test on standardized features → scale-invariant comparison.
+  PSI on frequency-encoded categoricals → proper probability comparison.
+  OHE columns → binary drift detection per category.
 """
 from __future__ import annotations
 
@@ -20,8 +30,11 @@ from src.common.enums import DriftSeverity
 from src.drift.statistical_tests import StatisticalTestSuite
 from src.observability.event_bus import EventType, event_bus, make_event
 from src.observability.metrics import (
-    DRIFT_PSI, DRIFT_KS_PVALUE,
-    DRIFT_SCORE, DRIFT_FEATURES_DRIFTED, DRIFT_SEVERITY,
+    DRIFT_FEATURES_DRIFTED,
+    DRIFT_KS_PVALUE,
+    DRIFT_PSI,
+    DRIFT_SCORE,
+    DRIFT_SEVERITY,
     DRIFT_SEVERITY_MAP,
 )
 
@@ -30,19 +43,37 @@ logger = logging.getLogger("ml_platform.drift.detector")
 
 @dataclass
 class FeatureDriftResult:
+    """Drift result for one feature."""
     feature_name: str
     test_name: str
     statistic: float
     p_value: Optional[float]
     drift_score: float
     is_drifted: bool
-    ref_null_rate: float = 0.0   # NEW: explicit null tracking
-    cur_null_rate: float = 0.0   # NEW: explicit null tracking
+    ref_mean: float = 0.0
+    cur_mean: float = 0.0
+    ref_std: float = 0.0
+    cur_std: float = 0.0
     details: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "feature":     self.feature_name,
+            "test":        self.test_name,
+            "statistic":   round(self.statistic, 4),
+            "p_value":     round(self.p_value, 6) if self.p_value is not None else None,
+            "drift_score": round(self.drift_score, 4),
+            "is_drifted":  self.is_drifted,
+            "ref_mean":    round(self.ref_mean, 4),
+            "cur_mean":    round(self.cur_mean, 4),
+            "ref_std":     round(self.ref_std, 4),
+            "cur_std":     round(self.cur_std, 4),
+        }
 
 
 @dataclass
 class DriftReport:
+    """Complete drift detection report."""
     report_id: str
     timestamp: datetime
     reference_dataset_id: str
@@ -57,28 +88,18 @@ class DriftReport:
     concept_drift_details: dict[str, Any] = field(default_factory=dict)
     recommendations: list[str] = field(default_factory=list)
 
-    def to_dict(self) -> dict:
+    def to_dict(self) -> dict[str, Any]:
         return {
-            "report_id":             self.report_id,
-            "timestamp":             self.timestamp.isoformat(),
-            "overall_severity":      self.overall_severity.value,
-            "overall_drift_score":   round(self.overall_drift_score, 4),
-            "features_drifted":      self.features_drifted,
-            "features_total":        self.features_total,
-            "drift_proportion":      round(self.drift_proportion, 4),
+            "report_id":              self.report_id,
+            "timestamp":              self.timestamp.isoformat(),
+            "overall_severity":       self.overall_severity.value,
+            "overall_drift_score":    round(self.overall_drift_score, 4),
+            "features_drifted":       self.features_drifted,
+            "features_total":         self.features_total,
+            "drift_proportion":       round(self.drift_proportion, 4),
             "concept_drift_detected": self.concept_drift_detected,
             "feature_results": [
-                {
-                    "feature":     fr.feature_name,
-                    "test":        fr.test_name,
-                    "statistic":   round(fr.statistic, 4),
-                    "p_value":     round(fr.p_value, 6) if fr.p_value is not None else None,
-                    "drift_score": round(fr.drift_score, 4),
-                    "is_drifted":  fr.is_drifted,
-                    "ref_null_rate": fr.ref_null_rate,
-                    "cur_null_rate": fr.cur_null_rate,
-                }
-                for fr in self.feature_results
+                fr.to_dict() for fr in self.feature_results
             ],
             "recommendations": self.recommendations,
         }
@@ -86,12 +107,15 @@ class DriftReport:
 
 class DriftDetector:
     """
-    Detects data drift and concept drift.
+    Detects drift between processed reference and production datasets.
 
-    Key fix applied:
-    - dropna() is called once per feature, null rates are RECORDED
-      and emitted as events so dashboards can show null-drift separately.
-    - If null rate itself changed significantly, that IS drift.
+    Input: PROCESSED DataFrames (same sklearn feature space).
+    Auto-detects feature columns (no manual list needed).
+
+    Numeric processed features  → KS test + PSI
+    Binary OHE features         → Chi-square proportion test
+    Frequency-encoded features  → KS test (already numeric)
+    Target column               → concept drift detection
     """
 
     def __init__(
@@ -99,101 +123,126 @@ class DriftDetector:
         settings: Optional[DriftSettings] = None,
         model_id: str = "",
         pipeline_run_id: str = "",
-    ):
-        self.settings       = settings or get_settings().drift
-        self.test_suite     = StatisticalTestSuite()
-        self.model_id       = model_id
+    ) -> None:
+        self.settings        = settings or get_settings().drift
+        self.test_suite      = StatisticalTestSuite()
+        self.model_id        = model_id
         self.pipeline_run_id = pipeline_run_id
 
     def detect(
         self,
-        reference_df: pd.DataFrame,
-        current_df: pd.DataFrame,
-        numerical_features: list[str],
-        categorical_features: list[str],
+        reference_processed: pd.DataFrame,
+        production_processed: pd.DataFrame,
         target_column: Optional[str] = None,
         report_id: Optional[str] = None,
         reference_dataset_id: str = "reference",
-        current_dataset_id: str = "current",
+        current_dataset_id: str = "production",
     ) -> DriftReport:
+        """
+        Run drift detection on PROCESSED DataFrames.
+
+        Features auto-detected from DataFrame columns.
+        No manual feature lists required.
+
+        Parameters
+        ----------
+        reference_processed:
+            Processed reference DataFrame (sklearn-transformed).
+        production_processed:
+            Processed production DataFrame (same sklearn space).
+        target_column:
+            Target column name for concept drift (optional).
+        """
         report_id = report_id or str(uuid.uuid4())
+
+        # Auto-detect features — exclude target
+        all_cols     = [
+            c for c in reference_processed.columns
+            if c != target_column
+            and c in production_processed.columns
+        ]
+
+        # Split into numeric and binary-OHE
+        numeric_features = [
+            c for c in all_cols
+            if pd.api.types.is_numeric_dtype(reference_processed[c])
+        ]
+
+        logger.info(
+            f"Drift detection: {len(numeric_features)} features | "
+            f"ref={len(reference_processed)} rows | "
+            f"prod={len(production_processed)} rows"
+        )
 
         event_bus.emit(make_event(
             pipeline_run_id=self.pipeline_run_id,
             event_type=EventType.DRIFT_DETECTION_STARTED,
             step_name="drift_detection",
-            title="🔍 Drift Detection Started",
+            title="🔍 Drift Detection Started (Processed Features)",
             message=(
-                f"Comparing {len(reference_df)} reference rows vs "
-                f"{len(current_df)} current rows across "
-                f"{len(numerical_features)+len(categorical_features)} features"
+                f"{len(numeric_features)} features | "
+                f"ref={len(reference_processed)} | "
+                f"prod={len(production_processed)}"
             ),
             model_id=self.model_id,
             data={
-                "reference_rows": len(reference_df),
-                "current_rows":   len(current_df),
-                "numerical_features":   len(numerical_features),
-                "categorical_features": len(categorical_features),
+                "n_features":   len(numeric_features),
+                "ref_rows":     len(reference_processed),
+                "prod_rows":    len(production_processed),
             },
         ))
 
-        logger.info(
-            f"Drift detection: report_id={report_id}, "
-            f"ref={len(reference_df)}, cur={len(current_df)}"
-        )
-
-        if len(current_df) < self.settings.min_samples_for_drift:
-            logger.warning(
-                f"Current dataset ({len(current_df)} rows) below minimum "
-                f"({self.settings.min_samples_for_drift}). Results may be unreliable."
-            )
-
         feature_results: list[FeatureDriftResult] = []
 
-        # ── Numerical features ────────────────────────────────────────────────
-        for feature in numerical_features:
-            result = self._test_numerical_feature(
-                feature, reference_df, current_df
+        # ── Test each feature ──────────────────────────────────────────────
+        for feature in numeric_features:
+            result = self._test_feature(
+                feature,
+                reference_processed,
+                production_processed,
             )
-            if result:
+            if result is not None:
                 feature_results.append(result)
 
-        # ── Categorical features ──────────────────────────────────────────────
-        for feature in categorical_features:
-            result = self._test_categorical_feature(
-                feature, reference_df, current_df
-            )
-            if result:
-                feature_results.append(result)
-
-        # ── Concept drift ─────────────────────────────────────────────────────
-        concept_drift_detected   = False
+        # ── Concept drift ──────────────────────────────────────────────────
+        concept_drift        = False
         concept_drift_details: dict[str, Any] = {}
 
-        if (target_column
-                and target_column in reference_df.columns
-                and target_column in current_df.columns):
-            concept_drift_detected, concept_drift_details = \
-                self._detect_concept_drift(reference_df, current_df, target_column)
+        if (
+            target_column
+            and target_column in reference_processed.columns
+            and target_column in production_processed.columns
+        ):
+            concept_drift, concept_drift_details = self._detect_concept_drift(
+                reference_processed,
+                production_processed,
+                target_column,
+            )
 
-        # ── Aggregate ─────────────────────────────────────────────────────────
-        features_drifted  = sum(1 for fr in feature_results if fr.is_drifted)
-        features_total    = len(feature_results)
-        drift_proportion  = features_drifted / features_total if features_total > 0 else 0.0
-        overall_drift_score = float(
-            np.mean([fr.drift_score for fr in feature_results]) if feature_results else 0.0
+        # ── Aggregate ──────────────────────────────────────────────────────
+        features_drifted     = sum(1 for r in feature_results if r.is_drifted)
+        features_total       = len(feature_results)
+        drift_proportion     = (
+            features_drifted / features_total
+            if features_total > 0 else 0.0
         )
-        overall_severity = self._classify_severity(
-            drift_proportion, overall_drift_score, concept_drift_detected
+        overall_drift_score  = float(
+            np.mean([r.drift_score for r in feature_results])
+            if feature_results else 0.0
         )
-        recommendations = self._generate_recommendations(
-            overall_severity, drift_proportion, features_drifted,
-            concept_drift_detected, feature_results,
+        overall_severity     = self._classify_severity(
+            drift_proportion, overall_drift_score, concept_drift
+        )
+        recommendations      = self._generate_recommendations(
+            overall_severity, drift_proportion,
+            concept_drift, feature_results,
         )
 
         # Update Prometheus
         DRIFT_SCORE.labels(model_id=self.model_id).set(overall_drift_score)
-        DRIFT_FEATURES_DRIFTED.labels(model_id=self.model_id).set(features_drifted)
+        DRIFT_FEATURES_DRIFTED.labels(model_id=self.model_id).set(
+            features_drifted
+        )
         DRIFT_SEVERITY.labels(model_id=self.model_id).set(
             DRIFT_SEVERITY_MAP.get(overall_severity.value, 0)
         )
@@ -209,7 +258,7 @@ class DriftDetector:
             features_total=features_total,
             drift_proportion=drift_proportion,
             feature_results=feature_results,
-            concept_drift_detected=concept_drift_detected,
+            concept_drift_detected=concept_drift,
             concept_drift_details=concept_drift_details,
             recommendations=recommendations,
         )
@@ -219,100 +268,104 @@ class DriftDetector:
             event_type=EventType.DRIFT_DETECTION_COMPLETED,
             step_name="drift_detection",
             title=(
-                f"{'🟢' if overall_severity == DriftSeverity.NONE else '🔴'} "
-                f"Drift: {overall_severity.value.upper()}"
+                f"{'🔴' if overall_severity.value != 'none' else '🟢'} "
+                f"Drift: {overall_severity.value.upper()} | "
+                f"{features_drifted}/{features_total} features"
             ),
             message=(
-                f"{features_drifted}/{features_total} features drifted | "
                 f"Score: {overall_drift_score:.3f} | "
-                f"Concept drift: {concept_drift_detected}"
+                f"Concept drift: {concept_drift}"
             ),
             model_id=self.model_id,
-            status="success" if overall_severity == DriftSeverity.NONE else "warning",
-            severity="info" if overall_severity in (DriftSeverity.NONE, DriftSeverity.LOW) else "error",
+            status=(
+                "success"
+                if overall_severity.value == "none"
+                else "warning"
+            ),
             data=report.to_dict(),
         ))
 
         logger.info(
             f"Drift complete: severity={overall_severity.value}, "
-            f"drifted={features_drifted}/{features_total}"
+            f"drifted={features_drifted}/{features_total}, "
+            f"score={overall_drift_score:.3f}"
         )
 
         return report
 
-    def _test_numerical_feature(
+    # ─────────────────────────────────────────────────────────────────────
+    # Feature-level tests
+    # ─────────────────────────────────────────────────────────────────────
+
+    def _test_feature(
         self,
         feature: str,
-        reference_df: pd.DataFrame,
-        current_df: pd.DataFrame,
+        ref_df: pd.DataFrame,
+        prod_df: pd.DataFrame,
     ) -> Optional[FeatureDriftResult]:
-        if feature not in reference_df.columns or feature not in current_df.columns:
-            logger.warning(f"Feature '{feature}' missing, skipping.")
+        """
+        Test one feature for drift.
+        Since data is processed, no NaN handling needed (processor did it).
+        But we still guard for safety.
+        """
+        ref_vals  = ref_df[feature].dropna().values.astype(float)
+        prod_vals = prod_df[feature].dropna().values.astype(float)
+
+        if len(ref_vals) < 10 or len(prod_vals) < 10:
+            logger.debug(f"Skipping '{feature}': insufficient samples")
             return None
 
-        # Compute null rates BEFORE dropping — emit as part of drift signal
-        ref_null_rate = float(reference_df[feature].isnull().mean())
-        cur_null_rate = float(current_df[feature].isnull().mean())
-
-        ref_vals = reference_df[feature].dropna().to_numpy(dtype=float)
-        cur_vals = current_df[feature].dropna().to_numpy(dtype=float)
-
-        if len(ref_vals) < 10 or len(cur_vals) < 10:
-            logger.warning(
-                f"Skipping '{feature}': insufficient non-null values "
-                f"(ref={len(ref_vals)}, cur={len(cur_vals)})"
-            )
-            return None
-
-        ks_stat, ks_p      = self.test_suite.ks_test(ref_vals, cur_vals)
-        psi_value          = self.test_suite.psi_numerical(ref_vals, cur_vals, bins=20)
-        wasserstein        = self.test_suite.wasserstein_distance(ref_vals, cur_vals)
-
-        drift_score = self._compute_numerical_drift_score(ks_stat, ks_p, psi_value)
-        is_drifted  = (
-            ks_p < self.settings.ks_p_value_threshold
-            or psi_value > self.settings.psi_threshold
+        # Detect if this is a binary OHE column (0/1 only)
+        is_binary = (
+            set(np.unique(np.asarray(ref_vals))).issubset({0.0, 1.0})
+            and set(np.unique(np.asarray(prod_vals))).issubset({0.0, 1.0})
         )
 
-        # Null rate drift is ALSO drift
-        null_rate_delta = abs(cur_null_rate - ref_null_rate)
-        if null_rate_delta > 0.10:
-            is_drifted  = True
-            drift_score = max(drift_score, null_rate_delta)
+        if is_binary:
+            return self._test_binary_feature(feature, np.asarray(ref_vals), np.asarray(prod_vals))
+        else:
+            return self._test_continuous_feature(feature, np.asarray(ref_vals), np.asarray(prod_vals))
 
-        # Update Prometheus per-feature gauges
-        DRIFT_PSI.labels(model_id=self.model_id, feature=feature).set(psi_value)
-        DRIFT_KS_PVALUE.labels(model_id=self.model_id, feature=feature).set(ks_p)
+    def _test_continuous_feature(
+        self,
+        feature: str,
+        ref_vals: np.ndarray,
+        prod_vals: np.ndarray,
+    ) -> FeatureDriftResult:
+        """KS test + PSI for continuous/ordinal processed features."""
+        ks_stat, ks_p = self.test_suite.ks_test(ref_vals, prod_vals)
+        psi           = self.test_suite.psi_numerical(ref_vals, prod_vals, bins=20)
+        wasserstein   = self.test_suite.wasserstein_distance(ref_vals, prod_vals)
 
-        details = {
-            "ks_statistic":  round(ks_stat, 4),
-            "ks_p_value":    round(ks_p, 6),
-            "psi":           round(psi_value, 4),
-            "wasserstein":   round(wasserstein, 4),
-            "ref_mean":      round(float(np.mean(ref_vals)), 4),
-            "cur_mean":      round(float(np.mean(cur_vals)), 4),
-            "ref_std":       round(float(np.std(ref_vals)), 4),
-            "cur_std":       round(float(np.std(cur_vals)), 4),
-            "ref_null_rate": round(ref_null_rate, 4),
-            "cur_null_rate": round(cur_null_rate, 4),
-            "null_rate_delta": round(null_rate_delta, 4),
-        }
+        drift_score = self._compute_drift_score(ks_stat, ks_p, psi)
+        is_drifted  = (
+            ks_p < self.settings.ks_p_value_threshold
+            or psi > self.settings.psi_threshold
+        )
 
-        # Emit per-feature event
+        # Update Prometheus per-feature
+        DRIFT_PSI.labels(model_id=self.model_id, feature=feature).set(psi)
+        DRIFT_KS_PVALUE.labels(
+            model_id=self.model_id, feature=feature
+        ).set(ks_p)
+
         event_bus.emit(make_event(
             pipeline_run_id=self.pipeline_run_id,
             event_type=EventType.DRIFT_FEATURE_CHECKED,
             step_name="drift_detection",
-            title=f"{'🔴' if is_drifted else '🟢'} Drift: {feature}",
+            title=f"{'🔴' if is_drifted else '🟢'} {feature}",
             message=(
-                f"'{feature}': PSI={psi_value:.3f}, KS p={ks_p:.4f}, "
-                f"null_delta={null_rate_delta:.3f} → "
-                f"{'DRIFTED' if is_drifted else 'stable'}"
+                f"PSI={psi:.3f} KS_p={ks_p:.4f} W={wasserstein:.3f} "
+                f"→ {'DRIFT' if is_drifted else 'stable'}"
             ),
             model_id=self.model_id,
             status="warning" if is_drifted else "success",
-            severity="warning" if is_drifted else "info",
-            data={**details, "feature": feature},
+            data={
+                "feature": feature,
+                "psi":     round(psi, 4),
+                "ks_p":    round(ks_p, 6),
+                "ks_stat": round(ks_stat, 4),
+            },
         ))
 
         return FeatureDriftResult(
@@ -322,129 +375,114 @@ class DriftDetector:
             p_value=ks_p,
             drift_score=drift_score,
             is_drifted=is_drifted,
-            ref_null_rate=ref_null_rate,
-            cur_null_rate=cur_null_rate,
-            details=details,
+            ref_mean=float(np.mean(ref_vals)),
+            cur_mean=float(np.mean(prod_vals)),
+            ref_std=float(np.std(ref_vals)),
+            cur_std=float(np.std(prod_vals)),
+            details={
+                "psi":         round(psi, 4),
+                "ks_stat":     round(ks_stat, 4),
+                "ks_p_value":  round(ks_p, 6),
+                "wasserstein": round(wasserstein, 4),
+            },
         )
 
-    def _test_categorical_feature(
+    def _test_binary_feature(
         self,
         feature: str,
-        reference_df: pd.DataFrame,
-        current_df: pd.DataFrame,
-    ) -> Optional[FeatureDriftResult]:
-        if feature not in reference_df.columns or feature not in current_df.columns:
-            return None
+        ref_vals: np.ndarray,
+        prod_vals: np.ndarray,
+    ) -> FeatureDriftResult:
+        """Proportion test for binary OHE features."""
+        ref_prop  = float(np.mean(ref_vals))
+        prod_prop = float(np.mean(prod_vals))
 
-        ref_null_rate = float(reference_df[feature].isnull().mean())
-        cur_null_rate = float(current_df[feature].isnull().mean())
-
-        ref_vals = reference_df[feature].dropna()
-        cur_vals = current_df[feature].dropna()
-
-        if len(ref_vals) < 10 or len(cur_vals) < 10:
-            return None
-
-        psi_value          = self.test_suite.psi_categorical(ref_vals, cur_vals)
-        chi2_stat, chi2_p  = self.test_suite.chi_square_test(ref_vals, cur_vals)
-
-        drift_score = self._compute_categorical_drift_score(psi_value, chi2_p)
-        is_drifted  = (
-            psi_value > self.settings.psi_threshold
-            or chi2_p < self.settings.ks_p_value_threshold
+        # PSI for binary
+        eps       = 1e-8
+        psi_val   = abs(
+            (prod_prop + eps) - (ref_prop + eps)
+        ) * abs(
+            np.log((prod_prop + eps) / (ref_prop + eps))
         )
 
-        null_rate_delta = abs(cur_null_rate - ref_null_rate)
-        if null_rate_delta > 0.10:
-            is_drifted  = True
-            drift_score = max(drift_score, null_rate_delta)
+        diff          = abs(prod_prop - ref_prop)
+        drift_score   = min(diff * 2, 1.0)
+        is_drifted    = (
+            psi_val > self.settings.psi_threshold
+            or diff > 0.10  # >10% proportion shift
+        )
 
-        new_categories     = set(cur_vals.unique()) - set(ref_vals.unique())
-        missing_categories = set(ref_vals.unique()) - set(cur_vals.unique())
-
-        details = {
-            "psi":                round(psi_value, 4),
-            "chi2_statistic":     round(chi2_stat, 4),
-            "chi2_p_value":       round(chi2_p, 6),
-            "new_categories":     list(new_categories)[:10],
-            "missing_categories": list(missing_categories)[:10],
-            "ref_null_rate":      round(ref_null_rate, 4),
-            "cur_null_rate":      round(cur_null_rate, 4),
-        }
-
-        event_bus.emit(make_event(
-            pipeline_run_id=self.pipeline_run_id,
-            event_type=EventType.DRIFT_FEATURE_CHECKED,
-            step_name="drift_detection",
-            title=f"{'🔴' if is_drifted else '🟢'} Drift: {feature}",
-            message=(
-                f"'{feature}': PSI={psi_value:.3f}, χ²p={chi2_p:.4f} → "
-                f"{'DRIFTED' if is_drifted else 'stable'}"
-            ),
-            model_id=self.model_id,
-            status="warning" if is_drifted else "success",
-            severity="warning" if is_drifted else "info",
-            data={**details, "feature": feature},
-        ))
-
-        DRIFT_PSI.labels(model_id=self.model_id, feature=feature).set(psi_value)
+        DRIFT_PSI.labels(model_id=self.model_id, feature=feature).set(psi_val)
 
         return FeatureDriftResult(
             feature_name=feature,
-            test_name="psi+chi2",
-            statistic=chi2_stat,
-            p_value=chi2_p,
+            test_name="proportion+psi",
+            statistic=diff,
+            p_value=None,
             drift_score=drift_score,
             is_drifted=is_drifted,
-            ref_null_rate=ref_null_rate,
-            cur_null_rate=cur_null_rate,
-            details=details,
+            ref_mean=ref_prop,
+            cur_mean=prod_prop,
+            ref_std=0.0,
+            cur_std=0.0,
+            details={
+                "ref_proportion":  round(ref_prop, 4),
+                "prod_proportion": round(prod_prop, 4),
+                "difference":      round(diff, 4),
+                "psi":             round(psi_val, 4),
+            },
         )
-
-    def _compute_numerical_drift_score(
-        self, ks_stat: float, ks_p: float, psi: float
-    ) -> float:
-        ks_score  = min(ks_stat * 2, 1.0)
-        psi_score = min(psi / 0.5, 1.0)
-        return float(0.4 * ks_score + 0.6 * psi_score)
-
-    def _compute_categorical_drift_score(self, psi: float, chi2_p: float) -> float:
-        psi_score = min(psi / 0.5, 1.0)
-        p_score   = 1.0 - min(chi2_p, 1.0)
-        return float(0.6 * psi_score + 0.4 * p_score)
 
     def _detect_concept_drift(
         self,
-        reference_df: pd.DataFrame,
-        current_df: pd.DataFrame,
+        ref_df: pd.DataFrame,
+        prod_df: pd.DataFrame,
         target_column: str,
     ) -> tuple[bool, dict[str, Any]]:
-        ref_target = reference_df[target_column].dropna()
-        cur_target = current_df[target_column].dropna()
+        ref_target  = ref_df[target_column].dropna()
+        prod_target = prod_df[target_column].dropna()
 
         if pd.api.types.is_numeric_dtype(ref_target):
             ks_stat, ks_p = self.test_suite.ks_test(
-                np.asarray(ref_target), np.asarray(cur_target)
+                np.asarray(ref_target),
+                np.asarray(prod_target),
             )
             details = {
                 "test":      "ks_2samp",
                 "statistic": round(ks_stat, 4),
                 "p_value":   round(ks_p, 6),
                 "ref_mean":  round(float(np.mean(ref_target)), 4),
-                "cur_mean":  round(float(np.mean(cur_target)), 4),
+                "prod_mean": round(float(np.mean(prod_target)), 4),
             }
             drifted = ks_p < 0.01
         else:
-            psi = self.test_suite.psi_categorical(ref_target, cur_target)
+            psi = self.test_suite.psi_categorical(ref_target, prod_target)
             details = {
                 "test":             "psi",
                 "psi_value":        round(psi, 4),
-                "ref_distribution": ref_target.value_counts(normalize=True).head(10).to_dict(),
-                "cur_distribution": cur_target.value_counts(normalize=True).head(10).to_dict(),
+                "ref_distribution": (
+                    ref_target.value_counts(normalize=True)
+                    .head(10).to_dict()
+                ),
+                "prod_distribution": (
+                    prod_target.value_counts(normalize=True)
+                    .head(10).to_dict()
+                ),
             }
             drifted = psi > 0.15
 
         return drifted, details
+
+    # ─────────────────────────────────────────────────────────────────────
+    # Scoring and severity
+    # ─────────────────────────────────────────────────────────────────────
+
+    def _compute_drift_score(
+        self, ks_stat: float, ks_p: float, psi: float
+    ) -> float:
+        ks_score  = min(ks_stat * 2, 1.0)
+        psi_score = min(psi / 0.5, 1.0)
+        return float(0.4 * ks_score + 0.6 * psi_score)
 
     def _classify_severity(
         self,
@@ -466,39 +504,36 @@ class DriftDetector:
         self,
         severity: DriftSeverity,
         drift_proportion: float,
-        features_drifted: int,
         concept_drift: bool,
         feature_results: list[FeatureDriftResult],
     ) -> list[str]:
         recs = []
         if severity == DriftSeverity.CRITICAL:
-            recs.append("URGENT: Critical drift. Immediate retraining required.")
+            recs.append(
+                "URGENT: Critical drift. Immediate retraining required."
+            )
         if concept_drift:
-            recs.append("Concept drift in target. Model predictions degraded.")
+            recs.append(
+                "Concept drift in target variable. Model predictions degraded."
+            )
         if severity in (DriftSeverity.HIGH, DriftSeverity.CRITICAL):
-            recs.append("Schedule retraining with latest production data.")
+            recs.append(
+                "Retrain on current production data to capture new trends."
+            )
         if severity == DriftSeverity.MODERATE:
-            recs.append("Monitor closely. Consider retraining if metrics degrade.")
+            recs.append(
+                "Monitor performance closely. Schedule retraining if metrics degrade."
+            )
 
         drifted = sorted(
-            [fr for fr in feature_results if fr.is_drifted],
-            key=lambda x: x.drift_score, reverse=True,
+            [r for r in feature_results if r.is_drifted],
+            key=lambda x: x.drift_score,
+            reverse=True,
         )
         if drifted:
             recs.append(
-                f"Top drifted: {[f.feature_name for f in drifted[:5]]}"
-            )
-
-        # Highlight null drift
-        null_drifted = [
-            fr for fr in feature_results
-            if abs(fr.cur_null_rate - fr.ref_null_rate) > 0.10
-        ]
-        if null_drifted:
-            recs.append(
-                f"Null rate shift detected in: "
-                f"{[f.feature_name for f in null_drifted]}"
-                f" — check upstream data pipeline."
+                f"Top drifted features: "
+                f"{[r.feature_name for r in drifted[:5]]}"
             )
 
         return recs
