@@ -156,7 +156,7 @@ class ProductionDataProcessor:
     # Main entry point
     # ─────────────────────────────────────────────────────────────────────
 
-    def fit_transform_both(
+    def fit_transform(
         self,
         reference_df: pd.DataFrame,
         production_df: pd.DataFrame,
