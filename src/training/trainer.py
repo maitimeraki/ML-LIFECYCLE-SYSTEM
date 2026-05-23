@@ -57,7 +57,7 @@ class TrainingConfig:
     hyperparameters: dict[str, Any]
     feature_columns: list[str]
     target_column: str
-    cv_folds: int = 5
+    cv_folds: int = 10
     cv_scoring: str = "f1_weighted"
     random_state: int = 42
     test_size: float = 0.2
@@ -217,7 +217,7 @@ class ModelTrainer:
 
                 # Cross-validation
                 model: T = self.model_factory(config.hyperparameters)
-                # ✅ cross_val_score sees BaseEstimator at runtime (duck typing)
+                # cross_val_score sees BaseEstimator at runtime (duck typing)
                 cv_scores = cross_val_score(
                     model, X_train, y_train,
                     cv=config.cv_folds,
@@ -235,7 +235,7 @@ class ModelTrainer:
                     mlflow.log_metric(f"cv_fold_{i+1}", float(score))
                 
         
-                # ✅ Pylance sees .fit(), .predict(), .score() via Protocol
+                # Pylance sees .fit(), .predict(), .score() via Protocol
                 # Full training
                 model.fit(X_train, y_train)
 
