@@ -6,6 +6,114 @@ This document outlines the end-to-end production machine learning lifecycle, fro
 
 ---
 
+## Project Structure
+ml_lifecycle_platform/
+│
+├── README.md
+├── pyproject.toml
+├── Makefile
+├── Dockerfile
+├── docker-compose.yml
+├── .env.example
+│
+├── config/
+│   ├── __init__.py
+│   ├── settings.py
+│   ├── logging_config.py
+│   └── environments/
+│       ├── development.yaml
+│       ├── staging.yaml
+│       └── production.yaml
+│
+├── src/
+│   ├── __init__.py
+│   │
+│   ├── data/
+│   │   ├── __init__.py
+│   │   ├── ingestion.py
+│   │   ├── validation.py              # ← Great Expectations
+│   │   ├── preprocessing.py
+│   │   └── versioning.py
+│   │
+│   ├── drift/
+│   │   ├── __init__.py
+│   │   ├── detector.py                # ← Evidently
+│   │   ├── report_builder.py          # ← Evidently Reports
+│   │   └── alerting.py
+│   │
+│   ├── decision/
+│   │   ├── __init__.py
+│   │   └── retrain_policy.py
+│   │
+│   ├── training/
+│   │   ├── __init__.py
+│   │   └── trainer.py                 # ← MLflow
+│   │
+│   ├── evaluation/
+│   │   ├── __init__.py
+│   │   ├── validator.py               # ← MLflow
+│   │   └── champion_challenger.py
+│   │
+│   ├── registry/
+│   │   ├── __init__.py
+│   │   └── model_registry.py          # ← MLflow Registry
+│   │
+│   ├── serving/
+│   │   ├── __init__.py
+│   │   ├── service.py                 # ← BentoML
+│   │   ├── bentofile.yaml
+│   │   └── runners.py
+│   │
+│   ├── monitoring/
+│   │   ├── __init__.py
+│   │   ├── metrics.py                 # ← Prometheus
+│   │   └── performance_monitor.py
+│   │
+│   ├── orchestration/
+│   │   ├── __init__.py
+│   │   ├── pipeline.py                # ← Airflow DAG
+│   │   └── dags/
+│   │       ├── __init__.py
+│   │       ├── ml_lifecycle_dag.py    # ← Airflow DAG definition
+│   │       └── dag_utils.py
+│   │
+│   ├── observability/                 # NEW - White-box tracking
+│   │   ├── __init__.py
+│   │   ├── event_bus.py               # Central event emitter
+│   │   ├── step_tracker.py            # Per-step tracking
+│   │   ├── pipeline_state.py          # Global pipeline state
+│   │   └── formatters.py              # Standardized output formats
+│   │
+│   ├── api/
+│   │   ├── __init__.py
+│   │   ├── app.py                     # FastAPI
+│   │   ├── routes/
+│   │   │   ├── __init__.py
+│   │   │   ├── predictions.py
+│   │   │   ├── models.py
+│   │   │   ├── pipelines.py
+│   │   │   ├── drift.py
+│   │   │   ├── observability.py       # NEW - SSE/WebSocket
+│   │   │   └── health.py
+│   │   └── schemas/
+│   │       ├── __init__.py
+│   │       └── pipeline_events.py     # Frontend-ready schemas
+│   │
+│   └── common/
+│       ├── __init__.py
+│       ├── exceptions.py
+│       ├── enums.py
+│       └── utils.py
+│
+├── tests/
+│   ├── conftest.py
+│   ├── unit/
+│   └── integration/
+│
+└── scripts/
+    ├── run_pipeline.py
+    └── setup_infrastructure.sh
+
 ## Lifecycle Stages
 
 ### 1. New Data (Real-World)

@@ -10,7 +10,7 @@ ENV/
 env/
 
 # Data and Artifacts (Never commit raw data or large models)
-data/
+# data/
 *.csv
 *.xlsx
 *.jsonl
