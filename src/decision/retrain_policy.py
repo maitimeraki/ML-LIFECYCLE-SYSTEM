@@ -21,6 +21,7 @@ logger = logging.getLogger("ml_platform.decision.retrain_policy")
 @dataclass
 class PerformanceMetrics:
     """Current model performance metrics from production monitoring."""
+    # There is the drawback of only tracking one primary metric, but it keeps the decision logic simpler. We can always add more metrics later if needed. But in produciton has different matrics for different use cases, so we need to be flexible.
     primary_metric_name: str           # e.g., "f1_score", "rmse"
     primary_metric_value: float
     baseline_metric_value: float       # Value at deployment time
