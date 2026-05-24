@@ -32,7 +32,7 @@ import json
 import logging
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Optional, Annotated, Callable, Dict
+from typing import Any, Optional, Annotated, Dict
 
 import numpy as np
 import pandas as pd
@@ -535,7 +535,6 @@ with DAG(
             DataReadinessReport,
         )
         from src.common.enums import DriftSeverity
-        from src.drift.detector import DriftReport, FeatureDriftResult
 
         run_id = drift_result["run_id"]
 
@@ -677,7 +676,7 @@ with DAG(
     # Receives already-processed production data — no reprocessing
     # ──────────────────────────────────────────────────────────────────────────
 
-    @task(task_id="train_model")
+    @airflow_task(ta_id="train_model")
     def train_model(**context) -> dict[str, Any]:
         """
         Train new model on processed production data.
@@ -788,100 +787,153 @@ with DAG(
     # TASK 8: Champion-Challenger Evaluation
     # ──────────────────────────────────────────────────────────────────────────
 
-    @airflow_task(task_id="champion_challenger_evaluation")
+    @task(task_id="champion_challenger_evaluation")
     def champion_challenger_evaluation(**context) -> dict[str, Any]:
         """
-        Compare new model vs current champion.
-        Statistical significance test.
+        Full champion-challenger evaluation.
 
-        Airflow retry: safe — deterministic comparison.
+        WHAT CHANGED vs old version:
+        OLD: compared pre-computed metric dicts
+            (metrics came from training, not re-evaluated on same data)
+        NEW: loads BOTH model artifacts
+            evaluates BOTH on same held-out eval set
+            measures latency, memory, calibration, slices
+            runs hard gates before metric comparison
+
+        WHY same eval set for both:
+        Champion metrics from training used different data split.
+        Different data → unfair comparison → wrong decision.
+        Same eval set → apples to apples → correct decision.
         """
         import sys
         sys.path.insert(0, "/opt/airflow/ml_platform")
 
-        from src.evaluation.champion_challenger import (
-            ChampionChallengerEvaluator,
-            ModelPerformanceSnapshot,
-        )
+        from src.evaluation.champion_challenger import ChampionChallengerEvaluator
+        from src.registry.model_registry import ModelRegistry
 
         ti          = context["task_instance"]
         train_xcom  = ti.xcom_pull(task_ids="train_model")
         run_id      = train_xcom["run_id"]
         new_version = train_xcom["model_version"]
 
-        champion_version = Variable.get(
-            "champion_version", default=None
+        # Load processed evaluation data
+        prod_processed = pd.read_parquet(
+            train_xcom["prod_processed_path"]
+        ) if "prod_processed_path" in train_xcom else None
+
+        if prod_processed is None:
+            raise ValueError("No processed evaluation data available")
+
+        # Hold out 20% for evaluation
+        from sklearn.model_selection import train_test_split
+        target_col   = TARGET_COLUMN
+        feature_cols = [c for c in prod_processed.columns if c != target_col]
+
+        X = prod_processed[feature_cols]
+        y = prod_processed[target_col]
+
+        _, X_eval, _, y_eval = train_test_split(
+            X, y, test_size=0.20, random_state=42
         )
-        champion_f1      = float(
-            Variable.get("champion_f1_score", default="0.80")
+
+        # Champion version and artifact
+        champion_version = Variable.get("champion_version", default=None)
+
+        if champion_version:
+            # Get champion artifact from registry
+            try:
+                registry         = ModelRegistry(model_id=MODEL_ID)
+                champion_path    = registry.get_artifact_path(
+                    MODEL_ID, champion_version
+                )
+            except Exception:
+                champion_version = None
+                champion_path    = None
+        else:
+            champion_path = None
+
+        # Slice columns for per-segment evaluation
+        slice_columns = [
+            c for c in X_eval.columns
+            if X_eval[c].nunique() <= 10
+            and X_eval[c].nunique() >= 2
+        ][:3]   # Max 3 slice columns
+
+        evaluator = ChampionChallengerEvaluator(
+            pipeline_run_id=run_id,
+            model_id=MODEL_ID,
         )
+
+        if champion_version and champion_path:
+            comparison = evaluator.compare(
+                champion_version=champion_version,
+                champion_artifact_path=champion_path,
+                challenger_version=new_version,
+                challenger_artifact_path=train_xcom["artifact_path"],
+                X_eval=X_eval,
+                y_eval=y_eval,
+                is_classification=True,
+                slice_columns=slice_columns if slice_columns else None,
+            )
+
+            challenger_wins  = comparison.challenger_wins
+            improvement      = comparison.improvement
+            approval_status  = comparison.approval_status.value
+
+            # Log gate results to Airflow
+            for gate in comparison.gate_results:
+                logger.info(
+                    f"Gate [{gate.gate_name}]: "
+                    f"{'✅' if gate.passed else '❌'} {gate.message}"
+                )
+
+            result_data = comparison.to_dict()
+
+        else:
+            # First deployment — auto-approve with full evaluation
+            challenger_eval = evaluator.evaluator.evaluate(
+                model_version=new_version,
+                model_id=MODEL_ID,
+                artifact_path=train_xcom["artifact_path"],
+                X_eval=X_eval,
+                y_eval=y_eval,
+                is_classification=True,
+                slice_columns=slice_columns if slice_columns else None,
+                pipeline_run_id=run_id,
+            )
+
+            challenger_wins = True
+            improvement     = 1.0
+            approval_status = "auto_approved_first_deployment"
+
+            result_data = {
+                "challenger_wins":   True,
+                "approval_status":   approval_status,
+                "improvement":       1.0,
+                "challenger":        challenger_eval.to_dict(),
+                "gates":             [],
+                "reasons":           ["First deployment — auto-approved"],
+            }
 
         logger.info(
             f"Champion-Challenger: "
-            f"champion={champion_version or 'none'} "
-            f"vs challenger={new_version}"
-        )
-
-        if champion_version:
-            primary_metric = "f1_score"
-
-            evaluator  = ChampionChallengerEvaluator()
-            comparison = evaluator.compare(
-                champion=ModelPerformanceSnapshot(
-                    model_id=MODEL_ID,
-                    model_version=champion_version,
-                    metrics={
-                        "accuracy":  0.82,
-                        "f1_score":  champion_f1,
-                        "precision": 0.81,
-                        "recall":    0.79,
-                    },
-                    primary_metric_name=primary_metric,
-                    primary_metric_value=champion_f1,
-                    evaluation_dataset_id="champion_eval",
-                    evaluation_samples=0,
-                ),
-                challenger=ModelPerformanceSnapshot(
-                    model_id=MODEL_ID,
-                    model_version=new_version,
-                    metrics=train_xcom["metrics"],
-                    primary_metric_name=primary_metric,
-                    primary_metric_value=train_xcom["metrics"].get(
-                        primary_metric, 0.0
-                    ),
-                    evaluation_dataset_id=f"production_{run_id}",
-                    evaluation_samples=train_xcom["validation_samples"],
-                ),
-            )
-
-            challenger_is_better = comparison.challenger_is_better
-            improvement          = comparison.improvement
-            approval_status      = comparison.approval_status.value
-
-        else:
-            # No champion — first deployment, auto-approve
-            challenger_is_better = True
-            improvement          = 1.0
-            approval_status      = "auto_approved_first_deployment"
-
-        logger.info(
-            f"Evaluation: challenger_better={challenger_is_better}, "
-            f"improvement={improvement:.4f}"
+            f"{'APPROVED ✅' if challenger_wins else 'REJECTED ❌'} | "
+            f"improvement={improvement:.2%}"
         )
 
         return {
             "run_id":               run_id,
-            "challenger_is_better": challenger_is_better,
+            "challenger_is_better": challenger_wins,
             "improvement":          improvement,
             "approval_status":      approval_status,
             "new_version":          new_version,
             "champion_version":     champion_version,
-            # Pass through
-            "artifact_path":    train_xcom["artifact_path"],
-            "metrics":          train_xcom["metrics"],
-            "mlflow_run_id":    train_xcom["mlflow_run_id"],
-            "production_path":  train_xcom["production_path"],
-            "processor_path":   train_xcom["processor_path"],
+            "artifact_path":        train_xcom["artifact_path"],
+            "metrics":              train_xcom["metrics"],
+            "mlflow_run_id":        train_xcom["mlflow_run_id"],
+            "production_path":      train_xcom["production_path"],
+            "processor_path":       train_xcom["processor_path"],
+            "evaluation_summary":   result_data,
         }
 
     # ──────────────────────────────────────────────────────────────────────────
