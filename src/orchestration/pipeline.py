@@ -1196,8 +1196,11 @@ with DAG(
         strategy_str = Variable.get(
             "deployment_strategy", default="canary"
         )
+        # For simplicity, we use a single traffic manager (Istio) in this example.
+        from src.deployment.traffic_managers import IstioTrafficManager
 
         deployer = ModelDeployer(
+            traffic_manager=IstioTrafficManager(),
             model_id=MODEL_ID,
             pipeline_run_id=run_id,
         )
