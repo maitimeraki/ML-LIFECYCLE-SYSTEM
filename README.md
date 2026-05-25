@@ -331,3 +331,99 @@ If health **OK**:
                                             │   Monitoring +   │
                                             │   Loop Back) ◀───┘
                                             └──────────────────┘
+
+
+
+## Model State Transitions & Rollback Strategy
+champion_challenger → APPROVED
+        │
+        ▼
+register(STAGING)        ← Task 9
+        │                  Model exists in registry
+        │                  NOT serving traffic
+        │                  Rollback path: clear
+        │
+        ▼
+deploy(canary/blue-green) ← Task 10  [retries=3]
+        │                  Model IS serving traffic
+        │                  Registry still shows STAGING
+        │                  If fail: stays STAGING, champion still serves
+        │
+        ▼
+promote(CHAMPION)         ← Task 11
+        │                  Registry and production NOW in sync
+        │                  Old champion → ARCHIVED
+        │                  Rollback: registry.rollback_to_previous()
+        │
+        ▼
+shift_reference()         ← Task 12
+                           Production data saved as next reference
+                           Cycle complete
+
+### Strategy 9 – Register (STAGING)
+
+| Property | Value |
+|----------|-------|
+| Action | Register model in registry |
+| Status | STAGING |
+| Serving Traffic | No |
+| Rollback Path | Clear registry entry |
+
+**Note:** Model exists in registry but is NOT serving traffic.
+
+---
+
+### Strategy 10 – Deploy (Canary / Blue-Green)
+
+| Property | Value |
+|----------|-------|
+| Action | Deploy with canary/blue-green strategy |
+| Retries | 3 attempts |
+| Status | STAGING (registry unchanged) |
+| Serving Traffic | Yes |
+| If Fail | Stays STAGING, old champion still serves |
+
+**Note:** Model IS serving traffic. Registry still shows STAGING.
+
+---
+
+### Strategy 11 – Promote (CHAMPION)
+
+| Property | Value |
+|----------|-------|
+| Action | Promote model to champion |
+| Status | CHAMPION |
+| Old Champion | Moves to ARCHIVED |
+| Rollback | registry.rollback_to_previous() |
+
+**Note:** Registry and production are now in sync.
+
+---
+
+### Strategy 12 – Shift Reference
+
+| Property | Value |
+|----------|-------|
+| Action | Save production data as next reference |
+| Status | Cycle complete |
+| If Fail | Next cycle uses old reference |
+
+**Note:** Production data saved for future drift detection.
+
+---
+
+## Rollback States
+
+| Failure At | Registry Status | Who Serves? | Recovery |
+|------------|----------------|-------------|----------|
+| After Task 9 fails | STAGING | Old champion | Retry Task 9 |
+| After Task 10 fails | STAGING | Old champion | Retry Task 10 |
+| After Task 11 fails | STAGING | New model (serving) | Retry Task 11 |
+| After Task 12 fails | CHAMPION | New champion | Retry Task 12 |
+
+## Key Guarantees
+
+- ✅ Every failure is clean and recoverable
+- ✅ Every state is auditable
+- ✅ Old champion always available until promotion succeeds
+- ✅ No deadlock states
