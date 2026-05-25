@@ -649,7 +649,7 @@ with DAG(
     # TASK 7a: No Retrain Needed (skip path)
     # ──────────────────────────────────────────────────────────────────────────
 
-    @task(task_id="no_retrain_needed")
+    @airflow_task(task_id="no_retrain_needed")
     def no_retrain_needed(**context) -> dict[str, str]:
         """
         Skip path — model still reflects current trends.
@@ -676,7 +676,7 @@ with DAG(
     # Receives already-processed production data — no reprocessing
     # ──────────────────────────────────────────────────────────────────────────
 
-    @airflow_task(ta_id="train_model")
+    @airflow_task(task_id="train_model")
     def train_model(**context) -> dict[str, Any]:
         """
         Train new model on processed production data.
@@ -787,7 +787,7 @@ with DAG(
     # TASK 8: Champion-Challenger Evaluation
     # ──────────────────────────────────────────────────────────────────────────
 
-    @task(task_id="champion_challenger_evaluation")
+    @airflow_task(task_id="champion_challenger_evaluation")
     def champion_challenger_evaluation(**context) -> dict[str, Any]:
         """
         Full champion-challenger evaluation.
@@ -1069,23 +1069,114 @@ with DAG(
             f"Approval timeout after {timeout_seconds}s for run {run_id}"
         )
 
+
+    # TASK 10: Register Model (BEFORE Deploy)
+    # Registers in STAGING state — not champion yet
+    # If this fails: deploy never starts, clean retry
     # ──────────────────────────────────────────────────────────────────────────
-    # TASK 10: Deploy Model
-    # Canary / Blue-Green — health checks via Prometheus
+
+    @airflow_task(task_id="register_model_staging")
+    def register_model_staging(**context) -> dict[str, Any]:
+        """
+        Register newly trained model in STAGING state.
+
+        STAGING means:
+          - Model exists in registry with full lineage
+          - NOT serving production traffic yet
+          - Rollback path is clear if deploy fails
+          - Audit trail is intact regardless of deploy outcome
+
+        Why BEFORE deploy:
+          If deploy fails after registration → model is STAGING in registry
+          → retry deploy task only
+          → registry state is consistent and queryable
+
+        If deploy fails BEFORE registration → model is ghost in production
+          → registry has no record
+          → inconsistent state, manual intervention required
+        """
+        import sys
+        sys.path.insert(0, "/opt/airflow/ml_platform")
+
+        from src.registry.model_registry import ModelRegistry, ModelStage
+
+        ti          = context["task_instance"]
+        eval_xcom   = ti.xcom_pull(
+            task_ids="champion_challenger_evaluation"
+        )
+        run_id      = eval_xcom["run_id"]
+        new_version = eval_xcom["new_version"]
+
+        logger.info(
+            f"Registering model in STAGING: "
+            f"{MODEL_ID} v{new_version}"
+        )
+
+        registry = ModelRegistry(
+            pipeline_run_id=run_id,
+            model_id=MODEL_ID,
+        )
+
+        # Register as STAGING — not champion
+        # All lineage recorded here regardless of deploy outcome
+        registry.register(
+            model_id=MODEL_ID,
+            version=new_version,
+            mlflow_run_id=eval_xcom["mlflow_run_id"],
+            metrics=eval_xcom["metrics"],
+            hyperparameters={},
+            data_hash="",
+            artifact_path=eval_xcom["artifact_path"],
+            stage=ModelStage.STAGING,       # ← STAGING, not CHAMPION
+            tags={
+                "trained_on":        "production_data",
+                "pipeline_run_id":   run_id,
+                "airflow_run_id":    context["run_id"],
+                "champion_challenger": "approved",
+                "improvement":       str(eval_xcom.get("improvement", 0)),
+            },
+        )
+
+        logger.info(
+            f"Model registered as STAGING: {MODEL_ID} v{new_version} | "
+            f"Lineage recorded | "
+            f"Ready for deployment"
+        )
+
+        return {
+            **eval_xcom,
+            "registry_stage": "staging",
+            "registration_complete": True,
+        }
+        
+    # ──────────────────────────────────────────────────────────────────────────
+    # TASK 11: Deploy Model (AFTER Registry)
+    # Deploys the STAGING model
+    # If fails: model stays STAGING, retry this task only
     # ──────────────────────────────────────────────────────────────────────────
 
     @airflow_task(
         task_id="deploy_model",
         trigger_rule=TriggerRule.NONE_FAILED_MIN_ONE_SUCCESS,
+        retries=3,                          # Retry deploy independently
+        retry_delay=timedelta(minutes=2),
     )
     def deploy_model(**context) -> dict[str, Any]:
         """
-        Deploy new model using configured strategy.
+        Deploy STAGING model to production.
 
-        trigger_rule=NONE_FAILED_MIN_ONE_SUCCESS:
-          Runs after EITHER auto-approval OR manual approval path.
+        Runs AFTER registry.register(STAGING).
 
-        Airflow retry: if deployment fails → only deployment retries.
+        On failure:
+          - Model stays in STAGING state in registry
+          - Previous champion continues serving
+          - Only THIS task retries (not registration, not training)
+          - Clean rollback via registry
+
+        On success:
+          - Model serving production traffic
+          - NEXT task promotes to CHAMPION in registry
+          - Registry and production stay in sync
         """
         import sys
         sys.path.insert(0, "/opt/airflow/ml_platform")
@@ -1093,20 +1184,17 @@ with DAG(
         from src.deployment.deployer import ModelDeployer, DeploymentTarget
         from src.common.enums import DeploymentStrategy
 
-        ti = context["task_instance"]
-
-        # Get evaluation result (may come from either approval path)
-        eval_xcom = ti.xcom_pull(task_ids="champion_challenger_evaluation")
-        run_id    = eval_xcom["run_id"]
+        ti             = context["task_instance"]
+        registry_xcom  = ti.xcom_pull(task_ids="register_model_staging")
+        run_id         = registry_xcom["run_id"]
+        new_version    = registry_xcom["new_version"]
 
         logger.info(
-            f"Deploying: model={MODEL_ID}, "
-            f"version={eval_xcom['new_version']}, "
-            f"strategy={Variable.get('deployment_strategy', default='canary')}"
+            f"Deploying STAGING model: {MODEL_ID} v{new_version}"
         )
 
         strategy_str = Variable.get(
-            "deployment_strategy", default="direct"
+            "deployment_strategy", default="canary"
         )
 
         deployer = ModelDeployer(
@@ -1117,103 +1205,142 @@ with DAG(
         state = deployer.deploy(
             target=DeploymentTarget(
                 model_id=MODEL_ID,
-                model_version=eval_xcom["new_version"],
-                artifact_path=eval_xcom["artifact_path"],
+                model_version=new_version,
+                artifact_path=registry_xcom["artifact_path"],
                 endpoint_name=f"{MODEL_ID}_endpoint",
                 environment=Variable.get(
                     "environment", default="production"
                 ),
             ),
-            champion_version=eval_xcom["champion_version"],
+            champion_version=registry_xcom["champion_version"],
             strategy=DeploymentStrategy(strategy_str),
         )
 
         if state.rollback_triggered:
+            # Deployment health checks failed
+            # Model stays STAGING in registry (correct state)
+            # Previous champion is still serving (deployer reverted)
             raise RuntimeError(
                 f"Deployment rolled back: health checks failed. "
-                f"Champion v{eval_xcom['champion_version']} restored."
+                f"Model v{new_version} stays in STAGING. "
+                f"Champion v{registry_xcom['champion_version']} restored. "
+                f"Retry this task after investigating health check failures."
             )
 
         logger.info(
-            f"Deployment: status={state.status.value}, "
+            f"Deployment succeeded: {MODEL_ID} v{new_version} | "
+            f"strategy={strategy_str} | "
             f"health={state.health_checks_passed}✅ "
             f"{state.health_checks_failed}❌"
         )
 
         return {
-            "run_id":           run_id,
+            **registry_xcom,
             "deployment_status": state.status.value,
-            "new_version":      eval_xcom["new_version"],
-            "champion_version": eval_xcom["champion_version"],
-            "metrics":          eval_xcom["metrics"],
-            "mlflow_run_id":    eval_xcom["mlflow_run_id"],
-            "production_path":  eval_xcom["production_path"],
-            "processor_path":   eval_xcom["processor_path"],
+            "deployment_strategy": strategy_str,
+            "health_checks_passed": state.health_checks_passed,
+            "health_checks_failed": state.health_checks_failed,
         }
 
     # ──────────────────────────────────────────────────────────────────────────
-    # TASK 11: Promote + Shift Reference
-    # Registry promotion + production_raw becomes next cycle's reference
+    # TASK 12: Promote to Champion (AFTER Successful Deploy)
+    # Only called after deploy succeeds
+    # Registry → CHAMPION only when production is actually serving it
     # ──────────────────────────────────────────────────────────────────────────
 
-    @airflow_task(task_id="promote_and_shift_reference")
-    def promote_and_shift_reference(**context) -> dict[str, Any]:
+    @airflow_task(task_id="promote_to_champion")
+    def promote_to_champion(**context) -> dict[str, Any]:
         """
-        Register new champion in MLflow registry.
-        Save production_raw as next cycle's reference.
+        Promote STAGING model to CHAMPION in registry.
 
-        THE CYCLE KEY:
-          production_raw → saved as reference_raw.parquet
-          Next cycle: reference = this data
-          AutoConfigBuilder fits on this data
-          New feature space reflects current reality
+        Only runs after deploy_model succeeds.
+        This is the moment registry and production traffic are in sync.
 
-        WHY RAW (not processed)?
-          Next cycle needs to run AutoConfigBuilder on it.
-          AutoConfigBuilder needs raw data to detect dtypes,
-          cardinality, skewness, null rates.
-          Processed data would give wrong auto-config signals.
+        State transitions:
+          new model:      STAGING  → CHAMPION
+          old champion:   CHAMPION → ARCHIVED
+
+        After this task:
+          registry.get_champion() returns new model
+          Next pipeline: champion_version = new_version
+          Rollback path: registry.rollback_to_previous() → old model
         """
         import sys
         sys.path.insert(0, "/opt/airflow/ml_platform")
 
-        from src.registry.model_registry import ModelRegistry, ModelStage
+        from src.registry.model_registry import ModelRegistry
 
-        ti          = context["task_instance"]
-        deploy_xcom = ti.xcom_pull(task_ids="deploy_model")
-        run_id      = deploy_xcom["run_id"]
-        new_version = deploy_xcom["new_version"]
+        ti           = context["task_instance"]
+        deploy_xcom  = ti.xcom_pull(task_ids="deploy_model")
+        run_id       = deploy_xcom["run_id"]
+        new_version  = deploy_xcom["new_version"]
 
-        # Register in model registry
+        logger.info(
+            f"Promoting to CHAMPION: {MODEL_ID} v{new_version}"
+        )
+
         registry = ModelRegistry(
             pipeline_run_id=run_id,
             model_id=MODEL_ID,
         )
 
-        registry.register(
-            model_id=MODEL_ID,
-            version=new_version,
-            mlflow_run_id=deploy_xcom["mlflow_run_id"],
-            metrics=deploy_xcom["metrics"],
-            hyperparameters={},
-            data_hash="",
-            artifact_path=deploy_xcom.get("artifact_path", ""),
-            stage=ModelStage.STAGING,
-            tags={
-                "trained_on":      "production_data",
-                "pipeline_run_id": run_id,
-                "airflow_run_id":  context["run_id"],
-            },
-        )
-
+        # STAGING → CHAMPION
+        # Previous CHAMPION → ARCHIVED
         registry.promote_to_champion(
             model_id=MODEL_ID,
             version=new_version,
             pipeline_run_id=run_id,
         )
 
-        # ── SHIFT REFERENCE: production_raw → new reference ────────────────
-        production_df = pd.read_parquet(deploy_xcom["production_path"])
+        # Update Airflow Variables for next cycle
+        Variable.set("champion_version", new_version)
+        Variable.set(
+            "champion_f1_score",
+            str(deploy_xcom["metrics"].get("f1_score", 0))
+        )
+
+        logger.info(
+            f"Champion promoted: {MODEL_ID} v{new_version} | "
+            f"Previous champion archived | "
+            f"Registry and production are now in sync"
+        )
+
+        return {
+            **deploy_xcom,
+            "registry_stage": "champion",
+            "promotion_complete": True,
+        }
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # TASK 13: Shift Reference (AFTER Promotion)
+    # Production data → next cycle's reference
+    # ──────────────────────────────────────────────────────────────────────────
+
+    @airflow_task(task_id="shift_reference")
+    def shift_reference(**context) -> dict[str, Any]:
+        """
+        Save production_raw as next cycle's reference.
+
+        Runs after promote_to_champion.
+        The cycle shift only happens when:
+          ✅ Model is registered (lineage intact)
+          ✅ Model is deployed (serving traffic)
+          ✅ Model is champion (registry in sync)
+
+        If this task fails:
+          - Production is fine (model serving correctly)
+          - Registry is fine (champion promoted)
+          - Just next cycle uses old reference
+          - Retry this task only → no harm
+        """
+        ti           = context["task_instance"]
+        promote_xcom = ti.xcom_pull(task_ids="promote_to_champion")
+        run_id       = promote_xcom["run_id"]
+        new_version  = promote_xcom["new_version"]
+
+        production_df = pd.read_parquet(
+            promote_xcom["production_path"]
+        )
 
         new_reference_path = _artifact_path(
             MODEL_ID, "reference", "reference_raw.parquet"
@@ -1221,31 +1348,21 @@ with DAG(
         production_df.to_parquet(new_reference_path, index=False)
 
         logger.info(
-            f"✅ Cycle shift complete:"
-            f"\n  New champion:  {MODEL_ID} v{new_version}"
-            f"\n  New reference: {new_reference_path} "
-            f"({len(production_df)} rows)"
-            f"\n  Next cycle will compare against current production data"
-        )
-
-        # Update Airflow Variables for next cycle
-        Variable.set("champion_version",  new_version)
-        Variable.set(
-            "champion_f1_score",
-            str(deploy_xcom["metrics"].get("f1_score", 0))
+            f"Reference shifted: {len(production_df)} rows → "
+            f"{new_reference_path} | "
+            f"Next cycle reference = current production data"
         )
 
         return {
-            "run_id":              run_id,
-            "promoted_version":    new_version,
-            "new_reference_path":  new_reference_path,
-            "new_reference_rows":  len(production_df),
-            "metrics":             deploy_xcom["metrics"],
-            "outcome":             "success",
+            "run_id":             run_id,
+            "promoted_version":   new_version,
+            "new_reference_path": new_reference_path,
+            "new_reference_rows": len(production_df),
+            "outcome":            "success",
         }
 
     # ──────────────────────────────────────────────────────────────────────────
-    # TASK 12: Pipeline Report
+    # TASK 14: Pipeline Report
     # Always runs — summarizes what happened
     # ──────────────────────────────────────────────────────────────────────────
 
@@ -1378,20 +1495,30 @@ with DAG(
     # Approval paths
     rejected_result   = challenger_rejected()
     wait_result       = wait_for_approval_variable()
-    approval_branch >> [rejected_result, wait_result, deploy_model()]
+    approval_branch >> [rejected_result, wait_result]
 
-    # Deploy (runs after either auto-approval or manual approval)
+   # CORRECT ORDER:
+    # 1. Register STAGING (before any deployment)
+    registry_result   = register_model_staging()
+    approval_branch >> registry_result          # auto-approve path
+    wait_result     >> registry_result          # manual approve path
+
+    # 2. Deploy (after registry, retries independently)
     deploy_result     = deploy_model()
-    wait_result >> deploy_result
+    registry_result >> deploy_result
 
-    # Promote + shift reference
-    promote_result    = promote_and_shift_reference()
-    deploy_result >> promote_result
+    # 3. Promote to CHAMPION (after successful deploy)
+    promote_result    = promote_to_champion()
+    deploy_result   >> promote_result
 
-    # Report — always runs
+    # 4. Shift reference (after promotion)
+    shift_result      = shift_reference()
+    promote_result  >> shift_result
+
+    # Report always runs
     report_result     = pipeline_report()
     [
         skip_result,
         rejected_result,
-        promote_result,
+        shift_result,
     ] >> report_result
