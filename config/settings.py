@@ -61,6 +61,7 @@ class RetrainSettings(BaseSettings):
 
 
 class DeploymentSettings(BaseSettings):
+    """ Defines deployment strategies and thresholds for canary releases, including rollback conditions based on error rates and latency."""
     model_config = {"env_prefix": "DEPLOY_", "extra": "ignore"}
 
     strategy: str = "canary"
