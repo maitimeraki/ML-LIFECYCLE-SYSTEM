@@ -52,8 +52,8 @@ class BentoMLClient:
                 pool=5.0,
             ),
             limits=httpx.Limits(
-                max_connections=max_connections,
-                max_keepalive_connections=20,
+                max_connections=max_connections,  # Max 100 concurrent
+                max_keepalive_connections=20, # Keep 20 connections alive
             ),
             headers={
                 "Content-Type": "application/json",
@@ -80,7 +80,7 @@ class BentoMLClient:
         try:
             response = await self._client.post("/predict", json=payload)
             response.raise_for_status()
-            return response.json()
+            return response.json() # Type -> dict with prediction, probabilities, metadata
 
         except httpx.TimeoutException as exc:
             logger.error(f"BentoML timeout: {exc}")
