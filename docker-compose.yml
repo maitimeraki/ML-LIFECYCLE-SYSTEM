@@ -1,0 +1,132 @@
+# docker-compose.yml
+version: "3.9"
+
+services:
+
+  # ── ML Platform API ────────────────────────────────────────────────────────
+  ml-api:
+    build: .
+    command: uvicorn src.api.main:app --host 0.0.0.0 --port 8000 --reload
+    ports:
+      - "8000:8000"
+    environment:
+      - ENVIRONMENT=development
+      - MLFLOW_TRACKING_URI=http://mlflow:5000
+      - DEBUG=true
+    volumes:
+      - .:/app
+      - ml_models:/app/models
+      - ml_artifacts:/app/artifacts
+    depends_on:
+      - mlflow
+      - prometheus
+    networks:
+      - ml-network
+
+  # ── MLflow ────────────────────────────────────────────────────────────────
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:v2.10.0
+    command: >
+      mlflow server
+      --host 0.0.0.0
+      --port 5000
+      --default-artifact-root /mlflow/artifacts
+      --backend-store-uri sqlite:///mlflow/mlflow.db
+    ports:
+      - "5000:5000"
+    volumes:
+      - mlflow_data:/mlflow
+    networks:
+      - ml-network
+
+  # ── BentoML Serving ───────────────────────────────────────────────────────
+  bentoml-serving:
+    build: .
+    command: bentoml serve src.serving.bentoml_service:MLPlatformService --port 3000
+    ports:
+      - "3000:3000"
+    environment:
+      - MLFLOW_TRACKING_URI=http://mlflow:5000
+    volumes:
+      - .:/app
+      - ml_models:/app/models
+    depends_on:
+      - mlflow
+    networks:
+      - ml-network
+
+  # ── Prometheus ────────────────────────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:v2.48.0
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--web.enable-lifecycle"
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    networks:
+      - ml-network
+
+  # ── Grafana ───────────────────────────────────────────────────────────────
+  grafana:
+    image: grafana/grafana:10.2.3
+    ports:
+      - "3001:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./monitoring/grafana/datasources:/etc/grafana/provisioning/datasources:ro
+    depends_on:
+      - prometheus
+    networks:
+      - ml-network
+
+  # ── Airflow ───────────────────────────────────────────────────────────────
+  airflow-webserver:
+    image: apache/airflow:2.8.0
+    command: webserver
+    ports:
+      - "8080:8080"
+    environment:
+      - AIRFLOW__CORE__EXECUTOR=LocalExecutor
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=sqlite:////airflow/airflow.db
+      - AIRFLOW__CORE__LOAD_EXAMPLES=False
+      - MLFLOW_TRACKING_URI=http://mlflow:5000
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - .:/opt/airflow/ml_platform
+      - airflow_data:/airflow
+    networks:
+      - ml-network
+
+  airflow-scheduler:
+    image: apache/airflow:2.8.0
+    command: scheduler
+    environment:
+      - AIRFLOW__CORE__EXECUTOR=LocalExecutor
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=sqlite:////airflow/airflow.db
+      - MLFLOW_TRACKING_URI=http://mlflow:5000
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - .:/opt/airflow/ml_platform
+      - airflow_data:/airflow
+    networks:
+      - ml-network
+
+volumes:
+  ml_models:
+  ml_artifacts:
+  mlflow_data:
+  prometheus_data:
+  grafana_data:
+  airflow_data:
+
+networks:
+  ml-network:
+    driver: bridge
