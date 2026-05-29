@@ -42,7 +42,7 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: bentoml
-    command: >
+    command: |
       bash -c "
         sleep 15 &&
         (python scripts/run_pipeline.py > /app/logs/pipeline.log 2>&1 &) &&
@@ -81,8 +81,8 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: fastapi
-    command: >
-      uvicorn src.api.main:app
+    command: |
+      uvicorn src.api.app:app
         --host 0.0.0.0
         --port 8000
         --reload
@@ -197,11 +197,11 @@ services:
         condition: service_healthy
     networks:
       - ml-network
-    entrypoint: >
-      bash -c "
-        echo 'Running Airflow DB migration...' &&
-        airflow db migrate &&
-        echo 'Creating admin user...' &&
+    entrypoint: |
+      bash -c '
+        echo "Running Airflow DB migration..."
+        airflow db migrate
+        echo "Creating admin user..."
         airflow users create \
           --username admin \
           --password admin \
@@ -209,9 +209,9 @@ services:
           --lastname User \
           --role Admin \
           --email admin@ml.com \
-          2>/dev/null || true &&
-        echo 'Init complete.'
-      "
+          2>/dev/null || true
+        echo "Init complete."
+      '
     restart: "no"
 
   # ============================================
@@ -222,7 +222,7 @@ services:
       context: .
       dockerfile: Dockerfile.airflow
     container_name: airflow-api-server
-    command: >
+    command: |
       bash -c "
         echo 'Starting Airflow API Server...' &&
         airflow api-server --port 8080
