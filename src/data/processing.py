@@ -200,7 +200,7 @@ class ProductionDataProcessor:
             onehot_threshold=self.onehot_threshold,
             skewness_threshold=self.skewness_threshold,
         )
-        self._config = auto_builder.build(reference_df)
+        self._config = auto_builder.build(reference_df) # Return ProcessingConfig with column strategies based on reference data analysis
 
         # ── Step 2: Build sklearn Pipeline from auto-config ────────────────
         builder        = ProcessingPipelineBuilder(self._config)
@@ -235,7 +235,7 @@ class ProductionDataProcessor:
 
         # ── Step 6: Save fitted processor ──────────────────────────────────
         actual_save_path = save_path or (
-            f"artifacts/processors/{self.model_id}/processor.joblib"
+            f"artifacts/processors/{self.model_id}/processor_{self.pipeline_run_id}.joblib"
         )
         self.save(actual_save_path)
 
