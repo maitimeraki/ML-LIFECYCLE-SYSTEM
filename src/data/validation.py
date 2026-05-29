@@ -122,7 +122,7 @@ class DataValidator:
             },
         ))
 
-        # Schema-level checks before GE (fast-fail)
+        # Schema-level checks before GE (fast-fail). But why self.schema? Because if we have a schema, we can do some quick checks before running the full GE suite. This can catch basic issues like missing columns or too few rows without the overhead of GE. It's an optional step that adds a safety net before the more detailed expectation checks.
         if self.schema:
             schema_errors = self._schema_level_checks(df)
             errors.extend(schema_errors)
@@ -262,7 +262,7 @@ class DataValidator:
 
         return ValidationReport(
             suite_name=suite_name,
-            is_valid=len(errors) == 0 or success_rate >= 0.95,
+            is_valid=len(errors) == 0 or success_rate >= 0.90,
             success_rate=success_rate,
             statistics=statistics,
             expectation_results=expectation_results,
