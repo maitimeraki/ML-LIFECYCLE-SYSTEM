@@ -138,29 +138,29 @@ with DAG(
     max_active_runs=1,
     tags=["ml", "production", "lifecycle"],
     doc_md="""
-## ML Lifecycle Pipeline
+    ## ML Lifecycle Pipeline
 
-**Each task = one pipeline stage. Airflow manages everything.**
+    **Each task = one pipeline stage. Airflow manages everything.**
 
-| Task | Stage | Retry Safe |
-|------|-------|------------|
-| `load_data` | Load raw data from warehouse | ✅ |
-| `validate_production_data` | GE validation on production data | ✅ |
-| `process_both_datasets` | AutoConfig + fit(ref) + transform(ref+prod) | ✅ |
-| `detect_drift` | KS+PSI on processed features | ✅ |
-| `make_retrain_decision` | Multi-signal scoring | ✅ |
-| `branch_on_decision` | Route: retrain vs skip | ✅ |
-| `train_model` | MLflow-tracked training | ✅ |
-| `champion_challenger_evaluation` | Statistical approval gate | ✅ |
-| `wait_for_human_approval` | ExternalTaskSensor (Airflow UI) | ✅ |
-| `deploy_model` | Canary/Blue-green deployment | ✅ |
-| `promote_and_shift_reference` | Registry promote + new reference | ✅ |
-| `no_retrain_needed` | Skip path | ✅ |
+    | Task | Stage | Retry Safe |
+    |------|-------|------------|
+    | `load_data` | Load raw data from warehouse | ✅ |
+    | `validate_production_data` | GE validation on production data | ✅ |
+    | `process_both_datasets` | AutoConfig + fit(ref) + transform(ref+prod) | ✅ |
+    | `detect_drift` | KS+PSI on processed features | ✅ |
+    | `make_retrain_decision` | Multi-signal scoring | ✅ |
+    | `branch_on_decision` | Route: retrain vs skip | ✅ |
+    | `train_model` | MLflow-tracked training | ✅ |
+    | `champion_challenger_evaluation` | Statistical approval gate | ✅ |
+    | `wait_for_human_approval` | ExternalTaskSensor (Airflow UI) | ✅ |
+    | `deploy_model` | Canary/Blue-green deployment | ✅ |
+    | `promote_and_shift_reference` | Registry promote + new reference | ✅ |
+    | `no_retrain_needed` | Skip path | ✅ |
 
-**Monitoring:** `http://localhost:3001` (Grafana)
-**Experiments:** `http://localhost:5000` (MLflow)
-""",
-) as dag:
+    **Monitoring:** `http://localhost:3001` (Grafana)
+    **Experiments:** `http://localhost:5000` (MLflow)
+    """,
+    ) as dag:
 
     # ──────────────────────────────────────────────────────────────────────────
     # TASK 1: Load Data
@@ -209,11 +209,11 @@ with DAG(
         )
         production_df[TARGET_COLUMN] = (
             logits > logits.median()
-        ).astype(int)
+        ).astype(int) # Creation of the target columns of produciton df
 
         # Save production data to shared storage
         prod_path = _tmp_path(run_id, "production_raw.parquet")
-        production_df.to_parquet(prod_path, index=False)
+        production_df.to_parquet(prod_path, index=False) # Stored production df in temporary storage for the DAG run
 
         # Load reference from previous cycle OR use historical data
         ref_artifact = _artifact_path(
@@ -228,7 +228,7 @@ with DAG(
                 f"{len(reference_df)} rows"
             )
         else:
-            # First run: use historical data
+            # First run: use historical data. Use else to avoid accidentally using old reference after first run. Because after first run, reference will be saved to artifact path and should be used for next runs.
             rng_ref    = np.random.RandomState(42)
             n_ref      = 5000
             reference_df = pd.DataFrame({
@@ -280,12 +280,11 @@ with DAG(
         """
         Great Expectations validation on production data only.
         Reference data assumed clean (it was validated in a previous cycle).
-
         Airflow retry: if GE engine fails → only this task retries.
         Not the whole pipeline.
         """
         import sys
-        sys.path.insert(0, "/opt/airflow/ml_platform")
+        sys.path.insert(0, "/opt/airflow/ml_platform") # It is needed to import from ml_platform in Airflow tasks because Airflow tasks run in a different context where the ml_platform code is not in the default path. By adding it to sys.path, we can import our custom modules without issues.
 
         from src.data.validation import DataValidator, DatasetSchema, ColumnSchema
         from src.observability.event_bus import event_bus
@@ -295,14 +294,16 @@ with DAG(
 
         run_id    = load_result["run_id"]
         prod_path = load_result["production_path"]
+        ref_path  = load_result["reference_path"]
 
         production_df = pd.read_parquet(prod_path)
+        reference_df = pd.read_parquet(ref_path)
 
         logger.info(
             f"Validating production data: {len(production_df)} rows"
         )
 
-        schema = DatasetSchema(
+        schema = DatasetSchema(  # It makes the bottleneck for validation, so we keep it simple. In real life, this would be more complex and possibly loaded from a config file or built dynamically.
             columns=[
                 ColumnSchema("feature_1", "float64"),
                 ColumnSchema("feature_2", "float64"),
@@ -319,6 +320,7 @@ with DAG(
         validator = DataValidator(schema=schema)
         report    = validator.validate(
             df=production_df,
+            reference_df=reference_df,
             dataset_id=f"production_{run_id}",
             pipeline_run_id=run_id,
             model_id=MODEL_ID,
@@ -340,7 +342,7 @@ with DAG(
             "is_valid":      report.is_valid,
             "success_rate":  report.success_rate,
             "production_path": prod_path,
-            "reference_path":  load_result["reference_path"],
+            "reference_path":  ref_path,
             "production_rows": load_result["production_rows"],
             "reference_rows":  load_result["reference_rows"],
         }
@@ -387,7 +389,8 @@ with DAG(
             skewness_threshold=2.0,
             max_null_rate_to_drop=0.70,
         )
-
+        
+        # To save the processor artifact.
         processor_save_path = _artifact_path(
             MODEL_ID, "processors", f"{run_id}_processor.joblib"
         )
