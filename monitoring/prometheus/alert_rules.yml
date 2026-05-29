@@ -1,0 +1,18 @@
+groups:
+  - name: ml_platform
+    rules:
+      - alert: PredictionErrorRateHigh
+        expr: rate(ml_prediction_requests_total{status="error"}[5m]) / rate(ml_prediction_requests_total[5m]) > 0.01
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "High error rate for {{ $labels.model_id }}"
+
+      - alert: ModelDriftCritical
+        expr: ml_drift_severity_numeric > 3
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Critical drift for {{ $labels.model_id }}"
