@@ -110,6 +110,24 @@ class EventBus:
     2. OpenTelemetry span → Tempo/Jaeger
     3. Prometheus metrics (via metric callbacks)
     4. WebSocket → Frontend real-time feed
+    
+    Jaeger View:
+    Request: POST /predict (Total: 500ms)
+    │
+    ├── API Gateway: 5ms
+    │   └── Auth check: 3ms
+    │
+    ├── FastAPI Service: 495ms
+    │   ├── Input Validation: 2ms
+    │   ├── Feature Processing: 250ms  ← BOTTLENECK!
+    │   │   ├── DB Query (user profile): 200ms
+    │   │   └── Feature Engineering: 50ms
+    │   ├── Model Inference: 200ms
+    │   │   ├── Preprocessing: 50ms
+    │   │   └── Predict: 150ms
+    │   └── Response Formatting: 43ms
+    │
+    └── Audit Logging: 3ms
     """
 
     def __init__(self) -> None:
