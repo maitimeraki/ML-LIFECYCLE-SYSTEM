@@ -1,36 +1,37 @@
-FROM python:3.11-slim as builder
-
-WORKDIR /app
-
-# Install system dependencies
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential \
-    curl \
-    && rm -rf /var/lib/apt/lists/*
-
-# Install Python dependencies
-COPY pyproject.toml .
-RUN pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir -e ".[production]"
-
+# Dockerfile
 FROM python:3.11-slim
 
 WORKDIR /app
 
-# Copy installed packages from builder
-COPY --from=builder /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
-COPY --from=builder /usr/local/bin /usr/local/bin
+# System deps
+RUN apt-get update && apt-get install -y \
+    curl \
+    git \
+    gcc \
+    g++ \
+    && rm -rf /var/lib/apt/lists/*
 
-# Copy application code
+# Python deps
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy source
 COPY . .
 
-# Create non-root user
-RUN useradd --create-home appuser && \
-    mkdir -p /app/models /app/data /app/logs && \
-    chown -R appuser:appuser /app
+# Create directories
+RUN mkdir -p \
+    artifacts/processors \
+    artifacts/reference \
+    artifacts/models \
+    artifacts/model_registry \
+    reports/drift \
+    logs \
+    mlflow-artifacts
 
-USER appuser
+# Make scripts executable
+RUN chmod +x scripts/*.sh 2>/dev/null || true
 
-EXPOSE 8000
+ENV PYTHONPATH=/app
+ENV PYTHONUNBUFFERED=1
 
-CMD ["uvicorn", "src.api.app:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "4"]
+EXPOSE 8000 3000
