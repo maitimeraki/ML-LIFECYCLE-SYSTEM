@@ -287,6 +287,8 @@ class ProductionDataProcessor:
 
     @classmethod
     def load(cls, path: str) -> "ProductionDataProcessor":
+        """ Load a saved processor from disk. Validates type and logs the event.
+        """
         import joblib
         obj = joblib.load(path)
         if not isinstance(obj, cls):
