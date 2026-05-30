@@ -1,0 +1,13 @@
+scikit-learn==1.7.0
+pandas==2.3.3
+numpy>=1.24.0
+scipy==1.17.1
+joblib==1.5.3
+mlflow==3.12.0
+evidently==0.7.21
+great-expectations==1.16.1
+prometheus-client==0.25.0
+opentelemetry-sdk==1.42.1
+pydantic-settings==2.14.1
+psycopg2-binary>=2.9.9
+httpx==0.28.1
