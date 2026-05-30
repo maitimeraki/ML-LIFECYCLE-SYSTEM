@@ -135,8 +135,8 @@ class DriftDetector:
         production_processed: pd.DataFrame,
         target_column: Optional[str] = None,
         report_id: Optional[str] = None,
-        reference_dataset_id: str = "reference",
-        current_dataset_id: str = "production",
+        reference_dataset_id: str = str(uuid.uuid4()),
+        current_dataset_id: str = str(uuid.uuid4()),
     ) -> DriftReport:
         """
         Run drift detection on PROCESSED DataFrames.
