@@ -542,6 +542,7 @@ with DAG(
         run_id = drift_result["run_id"]
 
         # Reconstruct minimal drift report for policy engine
+        from src.drift.detector import DriftReport, FeatureDriftResult
         class _DriftProxy:
             """Lightweight proxy — avoids full deserialization."""
             def __init__(self, d: dict) -> None:
@@ -551,7 +552,7 @@ with DAG(
                 self.features_total         = d["features_total"]
                 self.drift_proportion       = d["drift_proportion"]
                 self.concept_drift_detected = d["concept_drift_detected"]
-                self.feature_results        = []
+                self.feature_results        = d["feature_results"]
 
         drift_proxy = _DriftProxy(drift_result)
 
@@ -564,7 +565,7 @@ with DAG(
             Variable.get("champion_f1_score", default="0.80")
         )
 
-        performance = PerformanceMetrics(
+        performance = PerformanceMetrics( # Performance of the current champion model on production data, as reported by monitoring or last evaluation. This is a critical signal for retrain decision.
             primary_metric_name="f1_score",
             primary_metric_value=current_metric,
             baseline_metric_value=baseline_metric,
@@ -576,10 +577,10 @@ with DAG(
         )
         last_training_date = datetime.fromisoformat(last_trained_str)
 
-        data_readiness = DataReadinessReport(
+        data_readiness = DataReadinessReport( # Data volume and quality signals. New data volume is a proxy for how much new information is available to learn from. If too low, retraining may not be worthwhile even if drift is detected.
             new_samples_available=drift_result.get("features_total", 0) * 100,
             min_samples_required=MIN_SAMPLES,
-            is_sufficient=True,
+            is_sufficient=True,  # It should be make dynamic based on new_samples_available vs min_samples_required, but for simplicity we set it to True. In real implementation, this would be calculated.
             label_availability_rate=0.95,
             data_freshness_days=1,
             quality_score=1.0,
@@ -778,10 +779,12 @@ with DAG(
             "cv_mean":           result.cv_mean,
             "cv_std":            result.cv_std,
             "metrics":           result.metrics,
+            "hyperparameters":    config.hyperparameters,
             "artifact_path":     result.model_artifact_path,
             "training_samples":  result.training_samples,
             "validation_samples": result.validation_samples,
             # Pass through
+            "prod_processed_path": decision_xcom["prod_processed_path"],
             "production_path":   decision_xcom["production_path"],
             "processor_path":    decision_xcom["processor_path"],
         }
@@ -933,6 +936,7 @@ with DAG(
             "champion_version":     champion_version,
             "artifact_path":        train_xcom["artifact_path"],
             "metrics":              train_xcom["metrics"],
+            "hyperparameters":     train_xcom["hyperparameters"],
             "mlflow_run_id":        train_xcom["mlflow_run_id"],
             "production_path":      train_xcom["production_path"],
             "processor_path":       train_xcom["processor_path"],
@@ -950,6 +954,7 @@ with DAG(
         """
         Check if human approval is required.
         Sets Airflow Variable for approval tracking.
+        This steps are necessary to integrate with Airflow's native ExternalTaskSensor for approval, which waits for a specific Variable to be set to "approved" before proceeding. By setting the Variable here, we can leverage Airflow's built-in mechanisms for human-in-the-loop
         """
         ti       = context["task_instance"]
         eval_xcom = ti.xcom_pull(task_ids="champion_challenger_evaluation")
@@ -1127,7 +1132,7 @@ with DAG(
             version=new_version,
             mlflow_run_id=eval_xcom["mlflow_run_id"],
             metrics=eval_xcom["metrics"],
-            hyperparameters={},
+            hyperparameters=eval_xcom["hyperparameters"],
             data_hash="",
             artifact_path=eval_xcom["artifact_path"],
             stage=ModelStage.STAGING,       # ← STAGING, not CHAMPION
