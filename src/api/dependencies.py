@@ -14,7 +14,7 @@ from fastapi import Depends
 from src.api.clients.bentoml_client import BentoMLClient
 from src.api.middleware.circuit_breaker import CircuitBreaker, get_circuit_breaker
 from src.api.middleware.rate_limiter import RateLimiter, get_rate_limiter
-from src.monitoring.performance_monitor import PerformanceMonitor
+from monitoring.performance_monitor import PerformanceMonitor
 from config.settings import get_settings
 
 logger = logging.getLogger("ml_platform.api.dependencies")
