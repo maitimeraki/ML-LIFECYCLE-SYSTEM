@@ -24,6 +24,8 @@ env/
 *.onnx
 models/
 artifacts/
+*artifacts*
+data/
 
 # Validation and Monitoring Reports
 .evidently/
@@ -43,6 +45,8 @@ credentials.json
 mlruns/
 .dvc/cache/
 .dvc/tmp/
+dags/
+logs/
 
 # IDEs and OS
 .qodo/
@@ -50,3 +54,9 @@ mlruns/
 .idea/
 .DS_Store
 Thumbs.db
+
+
+requirements-*.txt
+text.*
+NOTES.md
+DOUBT.md

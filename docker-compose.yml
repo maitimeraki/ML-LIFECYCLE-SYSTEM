@@ -1,7 +1,17 @@
 # docker-compose.yml
-version: "3.9"
+# version: "3.9"
 
 services:
+  # ═══════════════════════════════════════════════════════════════════════════
+  # Base image — built once, reused by fastapi + bentoml
+  # ═══════════════════════════════════════════════════════════════════════════
+  base:
+    build:
+      context: .
+      dockerfile: docker/base/Dockerfile
+    image: ml_platform_base
+    command: ["true"]
+    # profiles: ["build-only"]
 
   # ============================================
   # MLflow (FIXED: Removed pip install at runtime)
@@ -9,21 +19,21 @@ services:
   mlflow:
     build:
       context: .
-      dockerfile: Dockerfile
+      dockerfile: docker/mlflow/Dockerfile
     container_name: mlflow
-    command: >
-      bash -c "
-        mkdir -p /mlflow /mlflow-artifacts &&
-        mlflow server
-          --host 0.0.0.0
-          --port 5000
-          --default-artifact-root /mlflow-artifacts
-          --backend-store-uri sqlite:///mlflow/mlflow.db
-      "
+    # command: |
+    #   bash -c "
+    #     mkdir -p /mlflow /mlflow-artifacts &&
+    #     mlflow server
+    #       --host 0.0.0.0
+    #       --port 5000
+    #       --default-artifact-root /mlflow-artifacts
+    #       --backend-store-uri sqlite:///mlflow/mlflow.db
+    #   "
     ports:
       - "5000:5000"
     volumes:
-      - mlflow_data:/mlflow
+      - mlflow_db:/mlflow
       - mlflow_artifacts:/mlflow-artifacts
     networks:
       - ml-network
@@ -34,35 +44,39 @@ services:
       retries: 5
       start_period: 40s
 
+
   # ============================================
   # BentoML
   # ============================================
   bentoml:
     build:
       context: .
-      dockerfile: Dockerfile
+      dockerfile: docker/bentoml/Dockerfile
+    image: ml_platform_bentoml
     container_name: bentoml
-    command: |
-      bash -c "
-        sleep 15 &&
-        (python scripts/run_pipeline.py > /app/logs/pipeline.log 2>&1 &) &&
-        bentoml serve src.serving.bentoml_service:MLPlatformService --port 3000 --host 0.0.0.0
-      "
+    # command: |
+    #   bash -c "
+    #     sleep 15 &&
+    #     (python scripts/run_pipeline.py > /app/logs/pipeline.log 2>&1 &) &&
+    #     bentoml serve src.serving.bentoml_service:MLPlatformService --port 3000 --host 0.0.0.0
+    #   "
     ports:
       - "3000:3000"
     environment:
-      PYTHONPATH: /app
+      # PYTHONPATH: /app
       PYTHONUNBUFFERED: "1"
       ENVIRONMENT: development
       MLFLOW_TRACKING_URI: http://mlflow:5000
     volumes:
-      - ./:/app
-      - ./artifacts:/app/artifacts
-      - ./logs:/app/logs
-      - ./mlflow-artifacts:/app/mlflow-artifacts
+      - shared_artifacts:/app/artifacts
+      - shared_logs:/app/logs
     depends_on:
+      base:
+        condition: service_completed_successfully
       mlflow:
         condition: service_healthy
+      otel-collector:
+        condition: service_started
     networks:
       - ml-network
     restart: unless-stopped
@@ -79,35 +93,74 @@ services:
   fastapi:
     build:
       context: .
-      dockerfile: Dockerfile
+      dockerfile: docker/fastapi/Dockerfile
+    image: ml_platform_fastapi
     container_name: fastapi
-    command: |
-      uvicorn src.api.app:app
-        --host 0.0.0.0
-        --port 8000
-        --reload
+    # command: |
+    #   uvicorn src.api.app:app
+    #     --host 0.0.0.0
+    #     --port 8000
+    #     --reload
     ports:
       - "8000:8000"
     environment:
-      PYTHONPATH: /app
+      # PYTHONPATH: /app
       PYTHONUNBUFFERED: "1"
       ENVIRONMENT: development
+      OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4317"
       MLFLOW_TRACKING_URI: http://mlflow:5000
       BENTOML_URL: http://bentoml:3000
       API_KEY_PREDICT: predict-key-change-in-prod
       API_KEY_ADMIN: admin-key-change-in-prod
       API_KEY_READONLY: readonly-key-change-in-prod
     volumes:
-      - ./:/app
-      - ./artifacts:/app/artifacts
-      - ./logs:/app/logs
+      - shared_artifacts:/app/artifacts
+      - shared_logs:/app/logs
     depends_on:
+      base:
+        condition: service_completed_successfully
       bentoml:
         condition: service_healthy
+      otel-collector:
+        condition: service_started
     networks:
       - ml-network
     restart: unless-stopped
 
+  # ═══════════════════════════════════════════════════════════════════════════
+  # OpenTelemetry Collector — receives traces from services
+  # ═══════════════════════════════════════════════════════════════════════════
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.91.0
+    container_name: otel-collector
+    command: ["--config=/etc/otel-collector-config.yml"]
+    ports:
+      - "4317:4317"   # OTLP gRPC receiver
+      - "4318:4318"   # OTLP HTTP receiver
+      - "8888:8888"   # Prometheus metrics from collector itself
+    volumes:
+      - ./monitoring/otel/otel-collector-config.yml:/etc/otel-collector-config.yml:ro
+    networks:
+      - ml-network
+    depends_on:
+      - jaeger
+    restart: unless-stopped
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # Jaeger — distributed trace storage + UI
+  # ═══════════════════════════════════════════════════════════════════════════
+  jaeger:
+    image: jaegertracing/all-in-one:1.52
+    container_name: jaeger
+    ports:
+      - "16686:16686"   # Jaeger UI
+      - "14250:14250"   # gRPC ingestion (from collector)
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+      SPAN_STORAGE_TYPE: "memory"
+    networks:
+      - ml-network
+    restart: unless-stopped
   # ============================================
   # Prometheus
   # ============================================
@@ -176,19 +229,19 @@ services:
   airflow-init:
     build:
       context: .
-      dockerfile: Dockerfile.airflow
+      dockerfile: docker/airflow/Dockerfile
+    image: ml_platform_airflow
     container_name: airflow-init
     environment:
       AIRFLOW__CORE__EXECUTOR: LocalExecutor
       AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres-airflow:5432/airflow
       AIRFLOW__CORE__LOAD_EXAMPLES: "False"
-      AIRFLOW__API__SECRET_KEY: change-me-in-production
+      AIRFLOW__CORE__DAGS_FOLDER: /app/src/orchestration
+      AIRFLOW__API__SECRET_KEY: change-me
       PYTHONPATH: /app:/opt/airflow
       MLFLOW_TRACKING_URI: http://mlflow:5000
     volumes:
-      - ./dags:/opt/airflow/dags
-      - ./:/app
-      - ./artifacts:/app/artifacts
+      - shared_artifacts:/app/artifacts
       - airflow_data:/opt/airflow
     depends_on:
       postgres-airflow:
@@ -199,28 +252,20 @@ services:
       - ml-network
     entrypoint: |
       bash -c '
-        echo "Running Airflow DB migration..."
         airflow db migrate
-        echo "Creating admin user..."
         airflow users create \
-          --username admin \
-          --password admin \
-          --firstname Admin \
-          --lastname User \
-          --role Admin \
-          --email admin@ml.com \
-          2>/dev/null || true
-        echo "Init complete."
+          --username admin --password admin \
+          --firstname Admin --lastname User \
+          --role Admin --email admin@ml.com 2>/dev/null || true
+        echo "Init complete"
       '
     restart: "no"
 
   # ============================================
   # Airflow API Server (was "webserver" in 2.x)
   # ============================================
-  airflow-api-server:
-    build:
-      context: .
-      dockerfile: Dockerfile.airflow
+  airflow-webserver:
+    image: ml_platform_airflow
     container_name: airflow-api-server
     command: |
       bash -c "
@@ -233,13 +278,12 @@ services:
       AIRFLOW__CORE__EXECUTOR: LocalExecutor
       AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres-airflow:5432/airflow
       AIRFLOW__CORE__LOAD_EXAMPLES: "False"
-      AIRFLOW__API__SECRET_KEY: change-me-in-production
+      AIRFLOW__CORE__DAGS_FOLDER: /app/src/orchestration
+      AIRFLOW__WEBSERVER__SECRET_KEY: change-me
       PYTHONPATH: /app:/opt/airflow
       MLFLOW_TRACKING_URI: http://mlflow:5000
     volumes:
-      - ./dags:/opt/airflow/dags
-      - ./:/app
-      - ./artifacts:/app/artifacts
+      - shared_artifacts:/app/artifacts
       - airflow_data:/opt/airflow
     depends_on:
       postgres-airflow:
@@ -252,83 +296,49 @@ services:
       - ml-network
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/api/v1/health"]
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
       interval: 60s
       timeout: 30s
       retries: 5
       start_period: 120s
 
   # ============================================
-  # Airflow DAG Processor (NEW in 3.x - REQUIRED)
-  # ============================================
-  airflow-dag-processor:
-    build:
-      context: .
-      dockerfile: Dockerfile.airflow
-    container_name: airflow-dag-processor
-    command: airflow dag-processor
-    environment:
-      AIRFLOW__CORE__EXECUTOR: LocalExecutor
-      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres-airflow:5432/airflow
-      AIRFLOW__CORE__LOAD_EXAMPLES: "False"
-      PYTHONPATH: /app:/opt/airflow
-      MLFLOW_TRACKING_URI: http://mlflow:5000
-    volumes:
-      - ./dags:/opt/airflow/dags
-      - ./:/app
-      - ./artifacts:/app/artifacts
-      - airflow_data:/opt/airflow
-    depends_on:
-      postgres-airflow:
-        condition: service_healthy
-      airflow-init:
-        condition: service_completed_successfully
-      mlflow:
-        condition: service_healthy
-    networks:
-      - ml-network
-    restart: unless-stopped
-
-  # ============================================
   # Airflow Scheduler
   # ============================================
   airflow-scheduler:
-    build:
-      context: .
-      dockerfile: Dockerfile.airflow
+    image: ml_platform_airflow
     container_name: airflow-scheduler
     command: airflow scheduler
     environment:
       AIRFLOW__CORE__EXECUTOR: LocalExecutor
       AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres-airflow:5432/airflow
       AIRFLOW__CORE__LOAD_EXAMPLES: "False"
+      AIRFLOW__CORE__DAGS_FOLDER: /app/src/orchestration
       PYTHONPATH: /app:/opt/airflow
       MLFLOW_TRACKING_URI: http://mlflow:5000
     volumes:
-      - ./dags:/opt/airflow/dags
-      - ./:/app
-      - ./artifacts:/app/artifacts
+      - shared_artifacts:/app/artifacts
       - airflow_data:/opt/airflow
     depends_on:
       postgres-airflow:
-        condition: service_healthy
+          condition: service_healthy
       airflow-init:
         condition: service_completed_successfully
-      airflow-api-server:
-        condition: service_healthy
-      mlflow:
+      airflow-webserver:
         condition: service_healthy
     networks:
       - ml-network
     restart: unless-stopped
 
 volumes:
-  mlflow_data:
+  mlflow_db:
   mlflow_artifacts:
   prometheus_data:
   grafana_data:
   airflow_data:
   postgres_airflow_data:
+  shared_artifacts:   # ← all ML containers share this
+  shared_logs:        # ← all ML containers log here
 
 networks:
   ml-network:
