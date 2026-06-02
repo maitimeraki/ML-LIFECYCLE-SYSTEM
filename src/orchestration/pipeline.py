@@ -45,7 +45,7 @@ from airflow.providers.standard.sensors.external_task import ExternalTaskSensor
 from airflow.sdk import TriggerRule
 
 from sklearn.base import BaseEstimator
-from src.training.trainer import ModelProtocol, T
+
 
 from typing import TYPE_CHECKING, Any, TypeVar, ParamSpec
 
@@ -68,7 +68,7 @@ MODEL_ID       = Variable.get("model_id",        default="customer_churn_model")
 TARGET_COLUMN  = Variable.get("target_column",   default="target")
 TMP_DIR        = Variable.get("tmp_dir",         default="/tmp/ml_platform")
 ARTIFACT_DIR   = Variable.get("artifact_dir",    default="artifacts")
-MLFLOW_URI     = Variable.get("mlflow_uri",      default="http://localhost:5000")
+MLFLOW_URI     = Variable.get("mlflow_uri",      default="http://mlflow:5000")
 MIN_SAMPLES    = int(Variable.get("min_samples", default="1000"))
 
 DEFAULT_ARGS = {
@@ -230,7 +230,7 @@ with DAG(
         else:
             # First run: use historical data. Use else to avoid accidentally using old reference after first run. Because after first run, reference will be saved to artifact path and should be used for next runs.
             rng_ref    = np.random.RandomState(42)
-            n_ref      = 5000
+            n_ref      = 1000
             reference_df = pd.DataFrame({
                 "feature_1": rng_ref.normal(10, 2, n_ref),
                 "feature_2": rng_ref.normal(5, 1.5, n_ref),
