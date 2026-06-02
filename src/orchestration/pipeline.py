@@ -66,7 +66,7 @@ logger = logging.getLogger("ml_platform.dag.lifecycle")
 
 MODEL_ID       = Variable.get("model_id",        default="customer_churn_model")
 TARGET_COLUMN  = Variable.get("target_column",   default="target")
-TMP_DIR        = Variable.get("tmp_dir",         default="/tmp/ml_platform")
+TMP_DIR        = Variable.get("tmp_dir",         default="/tmp/ml_platform").strip()
 ARTIFACT_DIR   = Variable.get("artifact_dir",    default="artifacts")
 MLFLOW_URI     = Variable.get("mlflow_uri",      default="http://mlflow:5000")
 MIN_SAMPLES    = int(Variable.get("min_samples", default="1000"))
@@ -110,15 +110,15 @@ def airflow_task(
 
 def _tmp_path(run_id: str, name: str) -> str:
     """Deterministic temp file path per DAG run."""
-    path = Path(TMP_DIR) / run_id
+    path = Path(TMP_DIR)/run_id
     path.mkdir(parents=True, exist_ok=True)
     return str(path / name)
 
 
 def _artifact_path(model_id: str, *parts: str) -> str:
-    path = Path(ARTIFACT_DIR) / model_id
+    path = Path(ARTIFACT_DIR)/model_id
     for p in parts:
-        path = path / p
+        path = path/p
     path.parent.mkdir(parents=True, exist_ok=True)
     return str(path)
 
@@ -664,7 +664,7 @@ with DAG(
         run_id   = decision["run_id"]
 
         logger.info(
-            f"No retrain needed for run {run_id}. "
+            f"No retrain needed for run {run_id}."
             f"Decision: {decision['decision']} | "
             f"Reasons: {decision['reasons']}"
         )
