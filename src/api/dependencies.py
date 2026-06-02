@@ -31,7 +31,7 @@ def _get_bentoml_client() -> BentoMLClient:
     Request 100 → Uses Connection 20 from pool
     Request 101 → Waits for free connection (or creates new one)"""
     settings = get_settings()
-    url      = getattr(settings, "bentoml_url", "http://localhost:3000")
+    url      = getattr(settings, "bentoml_url", "http://bentoml:3000")
     return BentoMLClient(base_url=url, timeout_seconds=30.0)
 
 
