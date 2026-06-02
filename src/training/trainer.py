@@ -126,8 +126,17 @@ class ModelTrainer:
         # Configure MLflow
         mlflow.set_tracking_uri(self.settings.mlflow.tracking_uri)
         self._experiment_name = (
-            f"{self.settings.mlflow.experiment_prefix}/{model_id or 'default'}"
+            f"{self.settings.mlflow.experiment_prefix}/{model_id or 'default'}_v2"
         )
+        # Check if experiment exists
+        experiment = mlflow.get_experiment_by_name(self._experiment_name)
+
+        if experiment is None:
+            # Create with correct artifact location
+            mlflow.create_experiment(
+                name=self._experiment_name,
+                artifact_location="/tmp/mlflow-artifacts"  # ← Explicit
+            )
         mlflow.set_experiment(self._experiment_name)
 
     def train(
@@ -256,15 +265,10 @@ class ModelTrainer:
                 try:
                     from mlflow.models.signature import infer_signature
                     signature = infer_signature(X_train, model.predict(X_train))
-                    mlflow.sklearn.log_model(
-                        model,
-                        artifact_path="model",
-                        signature=signature,
-                        registered_model_name=f"{model_id}",
-                    )
+                    mlflow.sklearn.log_model(model, name="model", signature=signature, registered_model_name=f"{model_id}")
                 except Exception as e:
                     logger.warning(f"MLflow model logging failed: {e}")
-                    mlflow.sklearn.log_model(model, artifact_path="model")
+                    mlflow.sklearn.log_model(model, name="model")
 
                 # Save local artifact
                 model_path = self._save_model_artifact(model, model_id, model_version)
