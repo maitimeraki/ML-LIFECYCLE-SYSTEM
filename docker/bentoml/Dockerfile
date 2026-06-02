@@ -5,7 +5,8 @@ FROM ml_platform_base AS bentoml
 RUN pip install --no-cache-dir \
     bentoml==1.4.39 \
     evidently==0.7.21 \
-    great-expectations==1.16.1
+    great-expectations==1.16.1 \
+    apache-airflow==3.2.1
 
 # Copy what bentoml needs (no api, no airflow)
 COPY config/             config/
