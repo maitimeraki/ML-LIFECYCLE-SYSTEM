@@ -194,6 +194,8 @@ class ProcessingPipelineBuilder:
             verbose_feature_names_out=True,   # e.g. "numeric__feature_1"
             n_jobs=-1,
         )
+        # Keep output as DataFrame for downstream LeakageGuard
+        column_transformer.set_output(transform="pandas")  # output DataFrame with feature names
 
         # Build OutlierHandler column strategies
         outlier_col_strategies = {}

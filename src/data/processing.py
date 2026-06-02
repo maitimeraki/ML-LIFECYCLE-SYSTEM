@@ -215,7 +215,7 @@ class ProductionDataProcessor:
         self._feature_names_out = self._get_feature_names()
 
         logger.info(
-            f"Pipeline fitted on reference data. "
+            f"Pipeline fitted on reference data."
             f"Features out: {len(self._feature_names_out)}"
         )
 
@@ -361,13 +361,13 @@ class ProductionDataProcessor:
 
     def _separate_target(
         self, df: pd.DataFrame
-    ) -> tuple[pd.DataFrame, Optional[pd.Series]]:
+    ) -> tuple[pd.DataFrame, pd.Series]:
         if self.target_column and self.target_column in df.columns:
             return (
                 df.drop(columns=[self.target_column]),
-                df[self.target_column].copy(),
+                pd.Series(df[self.target_column].copy()),
             )
-        return df.copy(), None
+        raise ValueError(f"Target column '{self.target_column}' not found in DataFrame.")
 
     def _get_feature_names(self) -> list[str]:
         """Extract and clean feature names from ColumnTransformer."""
