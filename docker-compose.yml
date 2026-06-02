@@ -21,15 +21,20 @@ services:
       context: .
       dockerfile: docker/mlflow/Dockerfile
     container_name: mlflow
-    # command: |
-    #   bash -c "
-    #     mkdir -p /mlflow /mlflow-artifacts &&
-    #     mlflow server
-    #       --host 0.0.0.0
-    #       --port 5000
-    #       --default-artifact-root /mlflow-artifacts
-    #       --backend-store-uri sqlite:///mlflow/mlflow.db
-    #   "
+    command: >
+      bash -c "
+        mkdir -p /mlflow /mlflow-artifacts &&
+        mlflow server
+          --host 0.0.0.0
+          --port 5000
+          --default-artifact-root /mlflow-artifacts
+          --backend-store-uri sqlite:///mlflow/mlflow.db
+      "
+    environment:
+      - MLFLOW_HOST=0.0.0.0
+      - MLFLOW_PORT=5000
+      - MLFLOW_BACKEND_STORE_URI=sqlite:///mlflow/mlflow.db
+      - MLFLOW_DEFAULT_ARTIFACT_ROOT=/mlflow-artifacts
     ports:
       - "5000:5000"
     volumes:
@@ -239,7 +244,7 @@ services:
       AIRFLOW__CORE__DAGS_FOLDER: /app/src/orchestration
       AIRFLOW__API__SECRET_KEY: change-me
       PYTHONPATH: /app:/opt/airflow
-      MLFLOW_TRACKING_URI: http://mlflow:5000
+      MLFLOW_TRACKING_URI: http://172.19.0.2:5000
     volumes:
       - shared_artifacts:/app/artifacts
       - airflow_data:/opt/airflow
@@ -281,7 +286,7 @@ services:
       AIRFLOW__CORE__DAGS_FOLDER: /app/src/orchestration
       AIRFLOW__WEBSERVER__SECRET_KEY: change-me
       PYTHONPATH: /app:/opt/airflow
-      MLFLOW_TRACKING_URI: http://mlflow:5000
+      MLFLOW_TRACKING_URI: http://172.19.0.2:5000
     volumes:
       - shared_artifacts:/app/artifacts
       - airflow_data:/opt/airflow
