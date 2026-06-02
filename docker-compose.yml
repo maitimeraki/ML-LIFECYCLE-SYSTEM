@@ -339,6 +339,7 @@ services:
       AIRFLOW__CORE__LOAD_EXAMPLES: "False"
       AIRFLOW__CORE__DAGS_FOLDER: /app/src/orchestration
       PYTHONPATH: /app:/opt/airflow
+      AIRFLOW__API__BASE_URL: http://airflow-webserver:8080
       MLFLOW_TRACKING_URI: http://mlflow:5000
     volumes:
       - shared_artifacts:/app/artifacts
