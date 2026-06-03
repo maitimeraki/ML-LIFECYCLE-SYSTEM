@@ -229,8 +229,8 @@ with DAG(
             )
         else:
             # First run: use historical data. Use else to avoid accidentally using old reference after first run. Because after first run, reference will be saved to artifact path and should be used for next runs.
-            rng_ref    = np.random.RandomState(42)
-            n_ref      = 1000
+            rng_ref    = np.random.default_rng()
+            n_ref      = 10000
             reference_df = pd.DataFrame({
                 "feature_1": rng_ref.normal(10, 2, n_ref),
                 "feature_2": rng_ref.normal(5, 1.5, n_ref),
