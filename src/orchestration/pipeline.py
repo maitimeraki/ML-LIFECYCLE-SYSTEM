@@ -1354,7 +1354,7 @@ with DAG(
         )
 
         new_reference_path = _artifact_path(
-            MODEL_ID, "reference", "reference_raw.parquet"
+            MODEL_ID, "reference", f"{new_version}_reference_raw.parquet"
         )
         production_df.to_parquet(new_reference_path, index=False)
 
