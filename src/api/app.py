@@ -19,6 +19,7 @@ from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from prometheus_client import make_asgi_app
+from prometheus_fastapi_instrumentator import Instrumentator
 
 from config.logging_config import setup_logging
 from config.settings import get_settings
@@ -94,9 +95,12 @@ def create_app() -> FastAPI:
         openapi_url="/openapi.json",
     )
 
-    # ── Prometheus metrics ─────────────────────────────────────────────────
-    metrics_app = make_asgi_app()
-    app.mount("/metrics", metrics_app)
+    # # ── Prometheus metrics ─────────────────────────────────────────────────
+    # metrics_app = make_asgi_app()
+    # app.mount("/metrics", metrics_app)
+    
+    # ── Auto-instrument FastAPI routes ────────────────────────────────────
+    Instrumentator().instrument(app).expose(app, endpoint="/metrics")
 
     # ── Middleware (order matters — outermost first) ────────────────────────
     app.add_middleware(AuditLoggerMiddleware)
