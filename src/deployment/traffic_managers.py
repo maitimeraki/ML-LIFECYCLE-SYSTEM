@@ -1,3 +1,7 @@
+import os
+# Check if running in Kubernetes
+IN_KUBERNETES = os.path.exists("/var/run/secrets/kubernetes.io/serviceaccount/token")
+
 class IstioTrafficManager:
     """Controls traffic splitting via Istio VirtualService."""
     
@@ -6,9 +10,13 @@ class IstioTrafficManager:
         Updates Istio VirtualService weights.
         Called by ModelDeployer._execute_canary().
         """
+        if not IN_KUBERNETES:
+            print(f"[SKIP] Not in Kubernetes. Would set traffic split: {split}")
+            return
         import yaml
         from kubernetes import client, config
         
+        # Original K8s code here
         config.load_incluster_config()
         api = client.CustomObjectsApi()
         

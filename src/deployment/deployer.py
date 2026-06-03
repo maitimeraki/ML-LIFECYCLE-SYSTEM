@@ -75,7 +75,7 @@ class PrometheusHealthSource:
     Falls back to 0.0 if Prometheus is unreachable (dev mode).
     """
 
-    def __init__(self, prometheus_url: str = "http://localhost:9090"):
+    def __init__(self, prometheus_url: str = "http://prometheus:9090"):
         self.prometheus_url = prometheus_url
 
     def get_error_rate(self, model_id: str) -> float:
@@ -132,7 +132,7 @@ class ModelDeployer:
         self,
         settings: Optional[DeploymentSettings] = None,
         traffic_manager: Optional[Any] = None,
-        prometheus_url: str = "http://localhost:9090",
+        prometheus_url: str = "http://prometheus:9090",
         model_id: str = "",
         pipeline_run_id: str = "",
     ):
