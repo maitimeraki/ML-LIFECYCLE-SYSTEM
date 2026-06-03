@@ -144,7 +144,7 @@ class EventBus:
             from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
 
             provider = TracerProvider()
-            exporter = OTLPSpanExporter(endpoint="http://localhost:4317", insecure=True)
+            exporter = OTLPSpanExporter(endpoint="http://otel-collector:4317", insecure=True)
             provider.add_span_processor(BatchSpanProcessor(exporter))
             trace.set_tracer_provider(provider)
             self._tracer = trace.get_tracer(service_name)
