@@ -35,8 +35,8 @@ class DatabaseSettings(BaseSettings):
 class MLflowSettings(BaseSettings):
     model_config = {"env_prefix": "MLFLOW_", "extra": "ignore"}
 
-    tracking_uri: str = "http://localhost:5000"
-    artifact_root: str = "./mlflow-artifacts"
+    tracking_uri: str = "http://mlflow:5000"
+    # artifact_root: str = "./mlflow-artifacts"
     experiment_prefix: str = "ml_platform"
 
 
@@ -52,7 +52,7 @@ class DriftSettings(BaseSettings):
 
 class RetrainSettings(BaseSettings):
     model_config = {"env_prefix": "RETRAIN_", "extra": "ignore"}
-
+    # Defines thresholds and conditions for triggering model retraining based on drift metrics, performance degradation, and data staleness.
     performance_degradation_threshold: float = 0.05
     min_new_samples: int = 1000
     max_staleness_days: int = 90
