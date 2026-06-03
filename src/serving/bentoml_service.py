@@ -120,11 +120,10 @@ class MLPlatformService:
     # ─────────────────────────────────────────────────────────────────────────
     # Prediction endpoints
     # ─────────────────────────────────────────────────────────────────────────
-    from bentoml.io import JSON  # Ensure this is imported
     @bentoml.api(
         route="/predict",
-        input_spec=JSON(pydantic_model=PredictInput),    # Fixed: Wrapped in JSON descriptor
-        output_spec=JSON(pydantic_model=PredictOutput),  # Fixed: Wrapped in JSON descriptor
+        input_spec=PredictInput ,    # Fixed: Wrapped in JSON descriptor
+        output_spec=PredictOutput,  # Fixed: Wrapped in JSON descriptor
     )
     def predict(self, input_data: PredictInput) -> PredictOutput:
         """Single prediction with caching and monitoring."""
