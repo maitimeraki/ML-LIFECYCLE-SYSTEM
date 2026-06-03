@@ -77,5 +77,5 @@ def _get_bentoml_client():
     from src.api.clients.bentoml_client import BentoMLClient
     from config.settings import get_settings
     settings = get_settings()
-    url      = getattr(settings, "bentoml_url", "http://localhost:3000")
+    url      = getattr(settings, "bentoml_url", "http://bentoml:3000")
     return BentoMLClient(base_url=url, timeout_seconds=5.0)
