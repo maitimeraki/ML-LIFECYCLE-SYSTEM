@@ -7,7 +7,8 @@ RUN pip install --no-cache-dir \
     uvicorn[standard]==0.47.0 \
     httpx==0.28.1 \
     python-multipart==0.0.29 \
-    pyjwt==2.13.0
+    pyjwt==2.13.0 \
+    prometheus-fastapi-instrumentator==8.0.0
 
 # Copy ONLY what fastapi needs
 COPY config/                 config/
