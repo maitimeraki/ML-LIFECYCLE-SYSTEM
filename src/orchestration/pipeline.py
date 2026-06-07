@@ -114,7 +114,7 @@ def _tmp_path(run_id: str, name: str) -> str:
     path.mkdir(parents=True, exist_ok=True)
     return str(path / name)
 
-
+# Path for saving artifacts that persist across runs (e.g. reference dataset, processor objects). Not per-run, but per-model.
 def _artifact_path(model_id: str, *parts: str) -> str:
     path = Path(ARTIFACT_DIR)/model_id
     for p in parts:
