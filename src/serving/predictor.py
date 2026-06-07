@@ -1,9 +1,8 @@
-# src/serving/predictor.py
 """
 Production prediction service.
 
 Wired to:
-  - ModelRegistry   → loads correct champion artifact
+  - ModelRegistry   → loads correct champion artifact (MLflow-first, file fallback)
   - ProductionDataProcessor → applies fitted processor at inference
   - Prometheus      → emits latency, error, cache metrics
   - EventBus        → emits prediction events for white-box visibility
@@ -17,6 +16,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
 import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
@@ -175,7 +175,7 @@ class ModelPredictor:
     Production prediction service.
 
     Responsibilities:
-      - Load champion from ModelRegistry
+      - Load champion from ModelRegistry (MLflow-first, file fallback)
       - Apply fitted processor at inference (zero data leakage)
       - Cache predictions (LRU, SHA256 key)
       - Emit Prometheus metrics on every request
@@ -208,68 +208,93 @@ class ModelPredictor:
         self._error_count       = 0
         self._total_latency_ms  = 0.0
 
-        # Load processor if provided
+        # Load processor if provided (static, not tied to model version)
         if processor_path and Path(processor_path).exists():
             self._processor = ProductionDataProcessor.load(processor_path)
             logger.info(f"Processor loaded: {processor_path}")
 
     # ─────────────────────────────────────────────────────────────────────────
-    # Model loading
+    # Model loading — MLflow-first with file fallback
     # ─────────────────────────────────────────────────────────────────────────
 
     def load_champion(self) -> str:
         """
         Load current champion from ModelRegistry.
+        MLflow-first: queries Production stage or champion alias.
+        Falls back to local file registry if MLflow unavailable.
+        
         Thread-safe — in-flight requests complete before swap.
         Returns loaded version string.
         """
-        settings = get_settings()
         registry = ModelRegistry(model_id=self.model_id)
-        champion = registry.get_champion(self.model_id) # Get latest production version
-
-        if champion is None:
+        
+        # NEW: Use get_champion_artifact_path() — handles MLflow + fallback
+        try:
+            artifact_path, version = registry.get_champion_artifact_path(self.model_id)
+            logger.info(f"Champion artifact resolved: {artifact_path} (v{version})")
+        except Exception as e:
             raise ModelLoadError(
-                f"No champion found for '{self.model_id}'",
-                details={"model_id": self.model_id},
-            )
+                f"Failed to resolve champion artifact for \'{self.model_id}\': {e}",
+                details={"model_id": self.model_id, "error": str(e)},
+            ) from e
 
-        artifact_path = registry.get_artifact_path(
-            self.model_id, champion.version
+        # Load model artifact
+        self._load_artifact(artifact_path, version)
+
+        # Load corresponding processor from shared volume
+        self._load_processor_for_champion(registry, version)
+
+        return version
+
+    def _load_processor_for_champion(
+        self, registry: ModelRegistry, version: str
+    ) -> None:
+        """Load processor matching the champion version."""
+        # Try to get champion metadata for pipeline_run_id
+        try:
+            champion = registry.get_champion(self.model_id)
+            pipeline_run_id = champion.tags.get("pipeline_run_id", "") if champion else ""
+        except Exception:
+            pipeline_run_id = ""
+
+        # Build processor path
+        processor_paths = [
+            # Path from champion metadata
+            Path("/app/artifacts") / self.model_id / "processors" / f"{pipeline_run_id}_processor.joblib",
+            # Fallback: version-based naming
+            Path("/app/artifacts") / self.model_id / "processors" / f"{version}_processor.joblib",
+            # Fallback: latest processor
+            Path("/app/artifacts") / self.model_id / "processors" / "latest_processor.joblib",
+        ]
+
+        for processor_path in processor_paths:
+            if processor_path.exists():
+                with self._lock:
+                    self._processor = ProductionDataProcessor.load(str(processor_path))
+                logger.info(f"Processor loaded for champion v{version}: {processor_path}")
+                return
+
+        logger.warning(
+            f"No processor found for champion v{version}. "
+            f"Tried: {[str(p) for p in processor_paths]}. "
+            f"Raw features will be used directly."
         )
-        self._load_artifact(artifact_path, champion.version)
-
-        # Load corresponding processor
-        processor_path = (
-            Path("artifacts") / "processors" / self.model_id
-            / "processor.joblib"
-        )
-        if processor_path.exists():
-            with self._lock:
-                self._processor = ProductionDataProcessor.load(
-                    str(processor_path)
-                )
-            logger.info(f"Processor loaded for champion v{champion.version}")
-        else:
-            logger.warning(
-                f"No processor found at {processor_path}. "
-                f"Raw features will be used directly."
-            )
-
-        return champion.version
 
     def load_version(self, version: str) -> None:
         """Load a specific model version (for A/B testing or rollback)."""
-        registry      = ModelRegistry(model_id=self.model_id)
+        registry = ModelRegistry(model_id=self.model_id)
         artifact_path = registry.get_artifact_path(self.model_id, version)
         self._load_artifact(artifact_path, version)
 
     def _load_artifact(self, artifact_path: str, version: str) -> None:
         """Thread-safe model artifact loading with validation.
-        # What happens during the swap?
-        # - Request A (in-flight): Uses OLD model (already in predict())
-        # - Request B (waiting): Waits for lock, then uses NEW model
-        # - Request C (new): Uses NEW model
-        # Result: ZERO errors, ZERO dropped requests"""
+        
+        What happens during the swap?
+        - Request A (in-flight): Uses OLD model (already in predict())
+        - Request B (waiting): Waits for lock, then uses NEW model
+        - Request C (new): Uses NEW model
+        Result: ZERO errors, ZERO dropped requests
+        """
         if not Path(artifact_path).exists():
             raise ModelLoadError(
                 f"Artifact not found: {artifact_path}",
@@ -281,7 +306,7 @@ class ModelPredictor:
 
             if not hasattr(new_model, "predict"):
                 raise ModelLoadError(
-                    f"Artifact missing 'predict' method: {artifact_path}"
+                    f"Artifact missing \'predict\' method: {artifact_path}"
                 )
 
             with self._lock:
@@ -550,7 +575,7 @@ class ModelPredictor:
         for col in self.feature_columns:
             if features.get(col) is None:
                 raise InputValidationError(
-                    f"Feature '{col}' is null",
+                    f"Feature \'{col}\' is null",
                     details={"feature": col},
                 )
 
@@ -569,17 +594,17 @@ class ModelPredictor:
             model_id=self.model_id,
             model_version=model_version,
             status=status,
-        ).inc()    # Increment counter
+        ).inc()
 
         if not cached:
             PREDICTION_LATENCY.labels(
                 model_id=self.model_id,
                 model_version=model_version,
-            ).observe(latency)  # Record latency in ms
+            ).observe(latency)
 
         PREDICTION_CACHE_HIT_RATE.labels(
             model_id=self.model_id
-        ).set(self._cache.hit_rate)   # 35% cache hit rate
+        ).set(self._cache.hit_rate)
 
     def _emit_error_metrics(
         self,
