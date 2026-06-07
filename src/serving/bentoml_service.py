@@ -103,6 +103,7 @@ class MLPlatformService:
         self.settings  = get_settings()
         self.predictor = ModelPredictor(
             model_id=MODEL_ID,
+            model_dir=self.settings.model_dir,
             feature_columns=[],   # Managed by processor
             cache_size=10_000,
         )
@@ -125,14 +126,14 @@ class MLPlatformService:
         input_spec=PredictInput ,    # Fixed: Wrapped in JSON descriptor
         output_spec=PredictOutput,  # Fixed: Wrapped in JSON descriptor
     )
-    def predict(self, input_data: PredictInput) -> PredictOutput:
+    def predict(self, features: dict[str, Any], request_id:str) -> PredictOutput:
         """Single prediction with caching and monitoring."""
-        request_id = input_data.request_id or str(uuid.uuid4())
+        request_id = request_id or str(uuid.uuid4())
 
         request = PredictionRequest(
             request_id=request_id,
-            features=input_data.features,
-            return_probabilities=input_data.return_probabilities,
+            features=features,
+            return_probabilities=False,
         )
 
         response = self.predictor.predict(request)
