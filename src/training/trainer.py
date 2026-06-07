@@ -446,9 +446,10 @@ class ModelTrainer:
     def _save_model_artifact(
         self, model: ModelProtocol, model_id: str, version: str
     ) -> str:
-        artifact_dir = self.settings.model_dir / model_id / version
+        artifact_dir = self.settings.registry_dir /self.settings.models_dir
         artifact_dir.mkdir(parents=True, exist_ok=True)
-        path = artifact_dir / "model.joblib"
+        path = artifact_dir / f"{model_id}_{version}_model.joblib"
+        # path = artifact_dir / model.joblib"
         joblib.dump(model, path)
         logger.info(f"Artifact: {path}")
         return str(path)
@@ -456,9 +457,9 @@ class ModelTrainer:
     def _save_preprocessing_artifact(
         self, model_id: str, version: str
     ) -> str:
-        artifact_dir = self.settings.model_dir / model_id / version
+        artifact_dir = self.settings.registry_dir / self.settings.models_dir
         artifact_dir.mkdir(parents=True, exist_ok=True)
-        path = artifact_dir / "preprocessing.joblib"
+        path = artifact_dir / f"{model_id}_{version}_preprocessing.joblib"
         if self.preprocessing_fn:
             joblib.dump(self.preprocessing_fn, path)
         return str(path)
