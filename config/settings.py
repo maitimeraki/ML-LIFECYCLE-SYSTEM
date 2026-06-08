@@ -36,7 +36,7 @@ class MLflowSettings(BaseSettings):
     model_config = {"env_prefix": "MLFLOW_", "extra": "ignore"}
 
     tracking_uri: str = "http://mlflow:5000"
-    # artifact_root: str = "./mlflow-artifacts"
+    artifact_root: str = "/app/artifacts/mlflow"
     experiment_prefix: str = "ml_platform"
 
 
@@ -102,12 +102,17 @@ class Settings(BaseSettings):
     prometheus: PrometheusSettings = Field(default_factory=PrometheusSettings)
 
     # Paths
-    data_dir: Path = Path("data")
-    model_dir: Path = Path("models")
-    log_dir: Path = Path("logs")
-    registry_dir: Path = Path("artifacts/model_registry")
+    datasets_dir: Path = Path("/app/artifacts/datasets")
+    processors_dir :Path =Path("/app/artifacts/processors")
+    reference_dir: Path = Path("/app/artifacts/references")
+    models_dir: Path = Path("/app/artifacts/model_registry/models")
+    log_dir: Path = Path("/app/logs")
+    # Base artifact directory (shared across all services via shared_artifacts volume)
+    artifacts_dir: Path = Path("/app/artifacts")
+    # Model registry metadata (local cache + MLflow fallback)
+    registry_dir: Path = Path("/app/artifacts/model_registry")
 
-    @field_validator("data_dir", "model_dir", "log_dir", "registry_dir", mode="after")
+    @field_validator("datasets_dir", "reference_dir","processors_dir", "artifacts_dir","models_dir", "log_dir", "registry_dir", mode="after")
     @classmethod
     def ensure_dirs_exist(cls, v: Path) -> Path:
         v.mkdir(parents=True, exist_ok=True)
