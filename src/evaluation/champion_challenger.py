@@ -1035,9 +1035,9 @@ class ChampionChallengerEvaluator:
 
     def compare(
         self,
-        champion_version: str,
+        champion_tag_version: str,
         champion_artifact_path: str,
-        challenger_version: str,
+        challenger_tag_version: str,
         challenger_artifact_path: str,
         X_eval: pd.DataFrame,
         y_eval: pd.Series,
@@ -1065,8 +1065,8 @@ class ChampionChallengerEvaluator:
         """
         logger.info(
             f"Champion-Challenger comparison: "
-            f"champion=v{champion_version} vs "
-            f"challenger=v{challenger_version} | "
+            f"champion=v{champion_tag_version} vs "
+            f"challenger=v{challenger_tag_version} | "
             f"eval_samples={len(X_eval)}"
         )
 
@@ -1076,23 +1076,23 @@ class ChampionChallengerEvaluator:
             step_name="evaluation",
             title="⚖️ Champion-Challenger Started",
             message=(
-                f"champion=v{champion_version} vs "
-                f"challenger=v{challenger_version} | "
+                f"champion=v{champion_tag_version} vs "
+                f"challenger=v{challenger_tag_version} | "
                 f"samples={len(X_eval)}"
             ),
             model_id=self.model_id,
             data={
-                "champion_version":   champion_version,
-                "challenger_version": challenger_version,
-                "eval_samples":       len(X_eval),
-                "slice_columns":      slice_columns or [],
+                "champion_tag_version":   champion_tag_version,
+                "challenger_tag_version": challenger_tag_version,
+                "eval_samples":           len(X_eval),
+                "slice_columns":          slice_columns or [],
             },
         ))
 
         # ── 1. Evaluate both models on same data ───────────────────────────
         logger.info("Evaluating champion...")
         champion_snapshot = self.evaluator.evaluate(
-            model_version=champion_version,
+            model_version=champion_tag_version,
             model_id=self.model_id,
             artifact_path=champion_artifact_path,
             X_eval=X_eval,
@@ -1104,7 +1104,7 @@ class ChampionChallengerEvaluator:
 
         logger.info("Evaluating challenger...")
         challenger_snapshot = self.evaluator.evaluate(
-            model_version=challenger_version,
+            model_version=challenger_tag_version,
             model_id=self.model_id,
             artifact_path=challenger_artifact_path,
             X_eval=X_eval,
@@ -1206,7 +1206,7 @@ class ChampionChallengerEvaluator:
             step_name="evaluation",
             title=(
                 f"{'✅ APPROVED' if challenger_wins else '❌ REJECTED'}: "
-                f"v{challenger_version}"
+                f"v{challenger_tag_version}"
             ),
             message=(
                 f"Composite: champ={champ_score:.3f} → chal={chal_score:.3f} | "
@@ -1216,7 +1216,7 @@ class ChampionChallengerEvaluator:
                 f"{len(gate_results)} passed"
             ),
             model_id=self.model_id,
-            model_version=challenger_version,
+            model_version=challenger_tag_version,
             status="success" if challenger_wins else "failed",
             data=result.to_dict(),
         ))
