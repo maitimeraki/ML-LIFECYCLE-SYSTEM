@@ -529,8 +529,8 @@ with DAG(
 
         Returns decision + priority score for BranchPythonOperator.
         """
-        import sys
-        sys.path.insert(0, "/opt/airflow/ml_platform")
+        # import sys
+        # sys.path.insert(0, "/opt/airflow/ml_platform")
 
         from src.decision.retrain_policy import (
             RetrainPolicyEngine,
@@ -691,8 +691,8 @@ with DAG(
         Airflow retry: if training fails (OOM, timeout), only this
         task reruns. Processing and drift are NOT rerun.
         """
-        import sys
-        sys.path.insert(0, "/opt/airflow/ml_platform")
+        # import sys
+        # sys.path.insert(0, "/opt/airflow/ml_platform")
 
         from sklearn.ensemble import GradientBoostingClassifier
         from src.training.trainer import ModelTrainer, TrainingConfig
@@ -811,8 +811,8 @@ with DAG(
         Different data → unfair comparison → wrong decision.
         Same eval set → apples to apples → correct decision.
         """
-        import sys
-        sys.path.insert(0, "/opt/airflow/ml_platform")
+        # import sys
+        # sys.path.insert(0, "/opt/airflow/ml_platform")
 
         from src.evaluation.champion_challenger import ChampionChallengerEvaluator
         from src.registry.model_registry import ModelRegistry
@@ -1103,8 +1103,8 @@ with DAG(
           → registry has no record
           → inconsistent state, manual intervention required
         """
-        import sys
-        sys.path.insert(0, "/opt/airflow/ml_platform")
+        # import sys
+        # sys.path.insert(0, "/opt/airflow/ml_platform")
 
         from src.registry.model_registry import ModelRegistry, ModelStage
 
@@ -1186,8 +1186,8 @@ with DAG(
           - NEXT task promotes to CHAMPION in registry
           - Registry and production stay in sync
         """
-        import sys
-        sys.path.insert(0, "/opt/airflow/ml_platform")
+        # import sys
+        # sys.path.insert(0, "/opt/airflow/ml_platform")
 
         from src.deployment.deployer import ModelDeployer, DeploymentTarget
         from src.common.enums import DeploymentStrategy
@@ -1276,8 +1276,8 @@ with DAG(
           Next pipeline: champion_version = new_version
           Rollback path: registry.rollback_to_previous() → old model
         """
-        import sys
-        sys.path.insert(0, "/opt/airflow/ml_platform")
+        # import sys
+        # sys.path.insert(0, "/opt/airflow/ml_platform")
 
         from src.registry.model_registry import ModelRegistry
 
@@ -1318,7 +1318,7 @@ with DAG(
 
         return {
             **deploy_xcom,
-            "registry_stage": "champion",
+            "registry_stage": "production",
             "promotion_complete": True,
         }
 
