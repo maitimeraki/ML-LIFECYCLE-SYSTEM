@@ -103,7 +103,7 @@ class MLPlatformService:
         self.settings  = get_settings()
         self.predictor = ModelPredictor(
             model_id=MODEL_ID,
-            model_dir=self.settings.model_dir,
+            model_dir=self.settings.models_dir,
             feature_columns=[],   # Managed by processor
             cache_size=10_000,
         )
