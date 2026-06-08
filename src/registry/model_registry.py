@@ -57,6 +57,7 @@ class ModelVersion:
         return d
 
 
+VERSION_TAG = "tag_version"  # To store our own versioning in MLflow tags
 class ModelRegistry:
     """
     MLflow-first model registry with local file fallback.
@@ -82,7 +83,7 @@ class ModelRegistry:
 
         # Local file cache (resilience + fast lookups)
         self._registry_path = self.settings.registry_dir
-        self._models_dir = self._registry_path / "models"
+        self._models_dir = self.settings.models_dir
         self._metadata_file = self._registry_path / "registry.json"
         self._models_dir.mkdir(parents=True, exist_ok=True)
         
@@ -119,6 +120,8 @@ class ModelRegistry:
             logger.debug(f"Found {len(versions)} versions in MLflow for {model_id} of data has {versions}")
             
             for mv in versions:
+                # Extract OUR custom version from tags
+                tag_version = mv.tags.get(VERSION_TAG, mv.version)
                 # Map MLflow stage to our enum
                 stage_map = {
                     "Production": ModelStage.CHAMPION,
@@ -129,7 +132,7 @@ class ModelRegistry:
                 stage = stage_map.get(str(mv.current_stage), ModelStage.DEVELOPMENT)
                 
                 # Build ModelVersion from MLflow data
-                key = f"{model_id}__{mv.version}"
+                key = f"{model_id}__{tag_version}"
                 self._registry[key] = ModelVersion(
                     model_id=model_id,
                     version=mv.version,
@@ -188,6 +191,11 @@ class ModelRegistry:
         # Try MLflow first
         if self._mlflow_available:
             try:
+                # # Search MLflow versions by our custom_version tag
+                # filter_string = (
+                #     f"name = '{model_id}' and "
+                #     f"tags.{VERSION_TAG} = '{tag_version}'"
+                # )
                 # Method 1: By stage
                 versions = self.mlflow_client.get_latest_versions(
                     model_id, stages=["Production"]
@@ -244,7 +252,7 @@ class ModelRegistry:
         
         return None
 
-    def get_champion_artifact_path(self, model_id: str) -> tuple[str, str]:
+    def get_champion_artifact_path(self, model_id: str, tag_version:str) -> tuple[str, str]:
         """
         Get champion artifact path and version. 
         Returns (path, version) or raises ModelNotFoundError.
@@ -274,12 +282,12 @@ class ModelRegistry:
                 logger.warning(f"MLflow artifact download failed: {e}")
 
         # Fallback: local file path
-        local_path = self._models_dir / f"{model_id}__{champion.version}.joblib"
+        local_path = self._models_dir / f"{model_id}__{tag_version}.joblib"
         if local_path.exists():
-            return str(local_path), champion.version
+            return str(local_path), tag_version
         
         raise ModelNotFoundError(
-            f"Artifact not found for champion {model_id} v{champion.version}",
+            f"Artifact not found for champion {model_id} v{tag_version}",
             details={
                 "mlflow_run_id": champion.mlflow_run_id,
                 "local_path": str(local_path),
@@ -318,7 +326,7 @@ class ModelRegistry:
 
         mv = ModelVersion(
             model_id=model_id,
-            version=version,
+            version=champion.version if champion else version,
             stage=stage,
             created_at=now,
             updated_at=now,
@@ -344,7 +352,7 @@ class ModelRegistry:
                 logger.warning(f"MLflow sync failed, keeping local: {e}")
                 self._mlflow_available = False
 
-        logger.info(f"Registered {model_id} v{version} at stage={stage.value}")
+        logger.info(f"Registered {model_id} v{champion.version if champion else version} at stage={stage.value}")
         event_bus.emit(make_event(
             pipeline_run_id=self.pipeline_run_id,
             event_type=EventType.PIPELINE_STAGE_COMPLETED,
@@ -442,7 +450,7 @@ class ModelRegistry:
                 self.mlflow_client.set_registered_model_alias(
                     name=model_id,
                     alias="champion",
-                    version=version
+                    version=new_champion.version,
                 )
             except Exception as e:
                 logger.warning(f"Could not set champion alias: {e}")
@@ -452,25 +460,25 @@ class ModelRegistry:
             CHAMPION_METRIC.labels(model_id=model_id, metric=metric).set(value)
 
         MODEL_INFO.labels(model_id=model_id).info({
-            "version": version,
+            "version": new_champion.version,
             "mlflow_run_id": new_champion.mlflow_run_id,
             "data_hash": new_champion.data_hash,
         })
 
-        logger.info(f"Promoted {model_id} v{version} to champion")
+        logger.info(f"Promoted {model_id} v{new_champion.version} to champion")
         event_bus.emit(make_event(
             pipeline_run_id=pipeline_run_id or self.pipeline_run_id,
             event_type=EventType.DEPLOYMENT_COMPLETED,
             step_name="registry",
-            title=f"👑 New Champion: {model_id} v{version}",
+            title=f"👑 New Champion: {model_id} v{new_champion.version}",
             message=(
                 f"Previous champion: {current.version if current else 'none'} → "
-                f"New champion: {version}"
+                f"New champion: {new_champion.version}"
             ),
             model_id=model_id,
-            model_version=version,
+            model_version=new_champion.version,
             data={
-                "new_champion":      version,
+                "new_champion":      new_champion.version,
                 "previous_champion": current.version if current else None,
                 "metrics":           new_champion.metrics,
             },
