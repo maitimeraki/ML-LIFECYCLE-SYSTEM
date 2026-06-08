@@ -260,11 +260,11 @@ class ModelPredictor:
         # Build processor path
         processor_paths = [
             # Path from champion metadata
-            Path("/app/artifacts") / self.model_id / "processors" / f"{pipeline_run_id}_processor.joblib",
+            Path("artifacts") / self.model_id / "processors" / f"{pipeline_run_id}_processor.joblib",
             # Fallback: version-based naming
-            Path("/app/artifacts") / self.model_id / "processors" / f"{version}_processor.joblib",
+            Path("artifacts") / self.model_id / "processors" / f"{version}_processor.joblib",
             # Fallback: latest processor
-            Path("/app/artifacts") / self.model_id / "processors" / "latest_processor.joblib",
+            Path("artifacts") / self.model_id / "processors" / "latest_processor.joblib",
         ]
 
         for processor_path in processor_paths:
