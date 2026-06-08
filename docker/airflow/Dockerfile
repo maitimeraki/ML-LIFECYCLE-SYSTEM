@@ -3,7 +3,11 @@ FROM apache/airflow:slim-3.2.1-python3.11
 
 USER root
 RUN apt-get update && apt-get install -y gcc g++ curl && rm -rf /var/lib/apt/lists/*
+# 1. Pre-create the directory structure so it exists
+RUN mkdir -p /app/artifacts
 
+# 2. Force change ownership of /app AND everything inside it to airflow
+RUN chown -R airflow:root /app
 # Install Airflow + ML deps as airflow user
 USER airflow
 
@@ -27,4 +31,4 @@ COPY --chown=airflow:root monitoring/         /app/monitoring/
 
 # CRITICAL: src/orchestration is the dags folder
 ENV AIRFLOW__CORE__DAGS_FOLDER=/app/src/orchestration
-ENV PYTHONPATH=/app:/opt/airflow
+ENV PYTHONPATH=/app:/app/artifacts
