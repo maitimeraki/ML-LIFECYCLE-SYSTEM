@@ -265,13 +265,13 @@ class ModelTrainer:
                     model, config.feature_columns
                 )
                 import os
-                artifact_base = "/app/artifacts/training"
+                artifact_base = "/app/artifacts/mlflow/training"
                 os.makedirs(artifact_base, exist_ok=True)
                 if feature_importance:
                     for fname, fval in feature_importance.items():
                         mlflow.log_metric(f"importance_{fname}", fval)
                         # Also save as JSON artifact for detailed view
-                    importance_path = f"{artifact_base}/feature_importance.json"
+                    importance_path = f"{artifact_base}/{model_version}_feature_importance.json"
                     import json
                     with open(importance_path, "w") as f:
                         json.dump(feature_importance, f, indent=2)
@@ -302,7 +302,7 @@ class ModelTrainer:
 
                 # Save local artifact
                 model_path = self._save_model_artifact(model, model_id, model_version)
-                mlflow.log_artifact(model_path, artifact_path="local_artifacts")
+                mlflow.log_artifact(model_path, artifact_path="models")
 
                 preprocessing_path = self._save_preprocessing_artifact(
                     model_id, model_version
@@ -506,10 +506,9 @@ class ModelTrainer:
     def _save_model_artifact(
         self, model: ModelProtocol, model_id: str, version: str
     ) -> str:
-        artifact_dir = self.settings.registry_dir /self.settings.models_dir
-        artifact_dir.mkdir(parents=True, exist_ok=True)
-        path = artifact_dir / f"{model_id}_{version}_model.joblib"
-        # path = artifact_dir / model.joblib"
+        models_dir = self.settings.models_dir
+        models_dir.mkdir(parents=True, exist_ok=True)
+        path = models_dir / f"{model_id}_{version}.joblib"
         joblib.dump(model, path)
         logger.info(f"Artifact: {path}")
         return str(path)
