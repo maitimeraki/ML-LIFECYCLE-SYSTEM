@@ -3,8 +3,10 @@
 Production data validation using Great Expectations 1.x.
 Emits granular events for every expectation check.
 
-Fix applied: NaN handling moved to column-level with explicit
-imputation strategy rather than silent per-feature dropna().
+Key features:
+  1. Schema-driven validation (explicit DatasetSchema)
+  2. Auto-profiling fallback (no schema → GE infers from data)
+  3. Reference data alignment checks (distribution drift)
 """
 from __future__ import annotations
 
@@ -15,6 +17,7 @@ from datetime import datetime, timezone
 from typing import Any, Optional
 
 import pandas as pd
+import numpy as np
 import great_expectations as gx
 from great_expectations.core import ExpectationSuite
 from great_expectations.expectations.expectation import Expectation
@@ -71,6 +74,11 @@ class ValidationReport:
 class DataValidator:
     """
     Great Expectations-based validator.
+    
+    Two modes:
+      1. SCHEMA-DRIVEN: Pass DatasetSchema → validates against explicit rules
+      2. AUTO-PROFILE:  No schema → GE infers expectations from data itself
+    
     Emits an event per expectation and updates Prometheus automatically
     via the registered EventBus handler.
     """
@@ -92,10 +100,11 @@ class DataValidator:
     ) -> ValidationReport:
         """
         Validate a DataFrame and emit observable events.
-
-        Critical fix: we no longer dropna() silently. 
-        Instead we track null rates explicitly and use GE's `mostly` 
-        parameter to encode tolerance.
+        
+        Mode selection:
+          - If expectations list provided → use those directly
+          - Elif schema provided → build from schema
+          - Else → auto-profile from data
         """
         suite_name = f"{model_id or 'dataset'}_{dataset_id}"
 
@@ -105,6 +114,7 @@ class DataValidator:
         start_time = time.perf_counter()
         errors: list[str] = []
 
+        # ── Emit start event ──────────────────────────────────────────────
         event_bus.emit(make_event(
             pipeline_run_id=pipeline_run_id,
             event_type=EventType.GE_SUITE_STARTED,
@@ -119,15 +129,16 @@ class DataValidator:
                 "row_count":    len(df),
                 "column_count": len(df.columns),
                 "columns":      list(df.columns),
+                "schema_mode":  "explicit" if self.schema else "auto-profile",
             },
         ))
 
-        # Schema-level checks before GE (fast-fail). But why self.schema? Because if we have a schema, we can do some quick checks before running the full GE suite. This can catch basic issues like missing columns or too few rows without the overhead of GE. It's an optional step that adds a safety net before the more detailed expectation checks.
+        # ── Schema-level fast-fail checks (only if schema provided) ───────
         if self.schema:
             schema_errors = self._schema_level_checks(df)
             errors.extend(schema_errors)
 
-        # Build GE datasource
+        # ── Build GE datasource ───────────────────────────────────────────
         try:
             ds_name = f"ds_{suite_name}_{int(time.time())}"
             data_source      = self.context.data_sources.add_pandas(name=ds_name)
@@ -140,11 +151,23 @@ class DataValidator:
                 gx.ExpectationSuite(name=suite_name)
             )
 
-            expectations_to_run = (
-                expectations
-                or self._build_expectations_from_schema(df)
-            )
+            # ── MODE SELECTION: explicit → schema → auto-profile ──────────
+            if expectations is not None:
+                # Mode 1: Caller provided explicit expectations
+                expectations_to_run = expectations
+                logger.info(f"Using {len(expectations)} caller-provided expectations")
+                
+            elif self.schema is not None:
+                # Mode 2: Build from DatasetSchema
+                expectations_to_run = self._build_expectations_from_schema(df)
+                logger.info(f"Schema-driven: {len(expectations_to_run)} expectations from schema")
+                
+            else:
+                # Mode 3: Auto-profile — no schema, infer from data
+                expectations_to_run = self._auto_profile_expectations(df)
+                logger.info(f"Auto-profile: {len(expectations_to_run)} expectations inferred")
 
+            # Add all expectations to suite
             for exp in expectations_to_run:
                 expectation = self._create_expectation(
                     exp["expectation_type"], exp.get("kwargs", {})
@@ -168,7 +191,7 @@ class DataValidator:
                 evaluated_at=datetime.now(timezone.utc).isoformat(),
             )
 
-        # Process results and emit events
+        # ── Process results ───────────────────────────────────────────────
         expectation_results: list[dict[str, Any]] = []
         passed = 0
         total = len(validation_results.results)
@@ -197,7 +220,7 @@ class DataValidator:
             }
             expectation_results.append(entry)
 
-            # Emit per-expectation event → Prometheus handler picks it up
+            # Emit per-expectation event
             event_bus.emit(make_event(
                 pipeline_run_id=pipeline_run_id,
                 event_type=EventType.GE_EXPECTATION_CHECKED,
@@ -215,13 +238,14 @@ class DataValidator:
                 progress=idx / total,
             ))
 
-        # Distribution alignment vs reference
+        # ── Distribution alignment vs reference ───────────────────────────
         alignment_results: list[dict[str, Any]] = []
         if reference_df is not None and not reference_df.empty:
             alignment_results = self._check_distribution_alignment(
                 df, reference_df, pipeline_run_id, model_id
             )
 
+        # ── Finalize report ─────────────────────────────────────────────
         success_rate  = passed / total if total > 0 else 0.0
         duration_ms   = (time.perf_counter() - start_time) * 1000
         data_snapshot = self._compute_snapshot(df)
@@ -233,11 +257,11 @@ class DataValidator:
             "success_percent":          round(success_rate * 100, 2),
         }
 
-        # Update Prometheus directly for suite-level gauge
+        # Update Prometheus
         GE_SUITE_SCORE.labels(suite_name=suite_name).set(success_rate)
         DATA_ROWS_VALIDATED.labels(model_id=model_id).inc(len(df))
 
-        # Emit suite completion → Prometheus handler
+        # Emit suite completion
         event_bus.emit(make_event(
             pipeline_run_id=pipeline_run_id,
             event_type=EventType.GE_SUITE_COMPLETED,
@@ -255,6 +279,7 @@ class DataValidator:
                 "suite_name": suite_name,
                 "statistics": statistics,
                 "data_snapshot": data_snapshot,
+                "alignment_results": alignment_results,
             },
             duration_ms=duration_ms,
             progress=1.0,
@@ -271,7 +296,11 @@ class DataValidator:
             data_snapshot=data_snapshot,
             alignment_results=alignment_results,
         )
-        
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # SCHEMA-LEVEL FAST-FAIL CHECKS
+    # ═══════════════════════════════════════════════════════════════════════
+
     def _schema_level_checks(self, df: pd.DataFrame) -> list[str]:
         """Fast schema checks before invoking GE."""
         errors = []
@@ -282,7 +311,6 @@ class DataValidator:
             errors.append(
                 f"Row count {len(df)} below minimum {self.schema.min_rows}"
             )
-        # referenced dataset -> schema and production dataset -> df
 
         required_cols = {c.name for c in self.schema.columns}
         missing = required_cols - set(df.columns)
@@ -290,6 +318,10 @@ class DataValidator:
             errors.append(f"Missing columns: {missing}")
 
         return errors
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # EXPECTATION BUILDERS
+    # ═══════════════════════════════════════════════════════════════════════
 
     def _create_expectation(
         self, exp_type: str, kwargs: dict[str, Any]
@@ -303,24 +335,22 @@ class DataValidator:
         except Exception as exc:
             logger.warning(f"Could not create '{exp_type}': {exc}")
             return None
-    
+
     def _build_expectations_from_schema(
         self, df: pd.DataFrame
     ) -> list[dict[str, Any]]:
         """
-        Generate expectations from schema or auto-profile.
-
-        Key fix: null rates are computed from the FULL column (not dropna'd),
-        so the `mostly` parameter accurately reflects production reality.
+        SCHEMA-DRIVEN MODE: Generate expectations from explicit DatasetSchema.
+        Uses schema rules + observed data for ranges.
         """
         expectations: list[dict[str, Any]] = []
 
-        # Table-level
+        # Table-level expectations
         expectations.append({
             "expectation_type": "ExpectTableRowCountToBeBetween",
             "kwargs": {
                 "min_value": self.schema.min_rows if self.schema else 100,
-                "max_value": None,
+                "max_value": self.schema.max_rows if self.schema else None,
             },
         })
         expectations.append({
@@ -331,6 +361,7 @@ class DataValidator:
             },
         })
 
+        # Map schema columns by name
         schema_map = (
             {c.name: c for c in self.schema.columns}
             if self.schema else {}
@@ -341,15 +372,13 @@ class DataValidator:
             total      = len(df)
             null_count = int(df[col].isnull().sum())
 
-            # Null tolerance: observed rate + 5% buffer, max 30%
-            # We do NOT drop nulls — we measure them on the full column
+            # ── Null handling ─────────────────────────────────────────────
             null_rate    = null_count / total if total > 0 else 0.0
             null_budget  = min(null_rate + 0.05, 0.30)
             mostly_valid = round(1.0 - null_budget, 4)
 
             if null_count == total:
-                # Column is 100% null — skip value expectations
-                logger.warning(f"Column '{col}' is 100%% null, skipping.")
+                logger.warning(f"Column '{col}' is 100% null, skipping.")
                 continue
 
             if col_schema and not col_schema.nullable:
@@ -360,7 +389,7 @@ class DataValidator:
                 "kwargs": {"column": col, "mostly": mostly_valid},
             })
 
-            # Allowed values from schema
+            # ── Allowed values (from schema) ──────────────────────────────
             if col_schema and col_schema.allowed_values:
                 expectations.append({
                     "expectation_type": "ExpectColumnValuesToBeInSet",
@@ -371,9 +400,8 @@ class DataValidator:
                     },
                 })
 
+            # ── Numeric columns: ranges + stats ───────────────────────────
             elif pd.api.types.is_numeric_dtype(df[col]):
-                # Use non-null values only for range computation
-                # but we DON'T mutate the dataframe
                 non_null = df[col].dropna()
                 if len(non_null) < 5:
                     continue
@@ -384,10 +412,16 @@ class DataValidator:
                 col_mean = float(desc["mean"])
 
                 # Schema overrides auto-profile
-                range_min = col_schema.min_value if (col_schema and col_schema.min_value is not None) \
+                range_min = (
+                    col_schema.min_value 
+                    if (col_schema and col_schema.min_value is not None)
                     else (col_min * 1.5 if col_min < 0 else col_min * 0.5)
-                range_max = col_schema.max_value if (col_schema and col_schema.max_value is not None) \
+                )
+                range_max = (
+                    col_schema.max_value 
+                    if (col_schema and col_schema.max_value is not None)
                     else (col_max * 1.5 if col_max > 0 else col_max * 0.5)
+                )
 
                 if range_min > range_max:
                     range_min, range_max = range_max, range_min
@@ -412,6 +446,7 @@ class DataValidator:
                         },
                     })
 
+            # ── Categorical columns ───────────────────────────────────────
             elif df[col].dtype in ("object", "category"):
                 unique_count = df[col].nunique(dropna=True)
                 if 0 < unique_count <= 50:
@@ -430,6 +465,109 @@ class DataValidator:
 
         return expectations
 
+    def _auto_profile_expectations(
+        self, df: pd.DataFrame
+    ) -> list[dict[str, Any]]:
+        """
+        AUTO-PROFILE MODE: No schema provided → infer expectations from data.
+        Great for exploratory data or when schema is unknown.
+        """
+        expectations: list[dict[str, Any]] = []
+
+        # Table-level
+        expectations.append({
+            "expectation_type": "ExpectTableRowCountToBeBetween",
+            "kwargs": {
+                "min_value": max(1, int(len(df) * 0.5)),  # At least 50% of current
+                "max_value": int(len(df) * 2.0),          # At most 2x current
+            },
+        })
+        expectations.append({
+            "expectation_type": "ExpectTableColumnsToMatchSet",
+            "kwargs": {
+                "column_set":   list(df.columns),
+                "exact_match":  True,
+            },
+        })
+
+        for col in df.columns:
+            total      = len(df)
+            null_count = int(df[col].isnull().sum())
+            null_rate  = null_count / total if total > 0 else 0.0
+
+            # Null tolerance: observed + 10% buffer, max 50%
+            null_budget  = min(null_rate + 0.10, 0.50)
+            mostly_valid = round(1.0 - null_budget, 4)
+
+            if null_count == total:
+                logger.warning(f"Column '{col}' is 100% null, skipping.")
+                continue
+
+            expectations.append({
+                "expectation_type": "ExpectColumnValuesToNotBeNull",
+                "kwargs": {"column": col, "mostly": mostly_valid},
+            })
+
+            # Type-specific expectations
+            if pd.api.types.is_numeric_dtype(df[col]):
+                non_null = df[col].dropna()
+                if len(non_null) < 5:
+                    continue
+
+                desc = non_null.describe()
+                col_min = float(desc["min"])
+                col_max = float(desc["max"])
+                col_mean = float(desc["mean"])
+
+                # Wider tolerance for auto-profile (less strict than schema)
+                range_min = col_min * 0.3 if col_min < 0 else col_min * 0.7
+                range_max = col_max * 1.7 if col_max > 0 else col_max * 0.3
+
+                if range_min > range_max:
+                    range_min, range_max = range_max, range_min
+
+                expectations.append({
+                    "expectation_type": "ExpectColumnValuesToBeBetween",
+                    "kwargs": {
+                        "column":    col,
+                        "min_value": round(range_min, 4),
+                        "max_value": round(range_max, 4),
+                        "mostly":    0.95,
+                    },
+                })
+
+                if col_mean != 0:
+                    expectations.append({
+                        "expectation_type": "ExpectColumnMeanToBeBetween",
+                        "kwargs": {
+                            "column":    col,
+                            "min_value": round(col_mean * 0.3, 4),
+                            "max_value": round(col_mean * 1.7, 4),
+                        },
+                    })
+
+            elif df[col].dtype in ("object", "category"):
+                unique_count = df[col].nunique(dropna=True)
+                if 0 < unique_count <= 50:
+                    top_cats = (
+                        df[col].value_counts(normalize=True, dropna=True)
+                        .head(20).index.tolist()
+                    )
+                    expectations.append({
+                        "expectation_type": "ExpectColumnValuesToBeInSet",
+                        "kwargs": {
+                            "column":    col,
+                            "value_set": top_cats,
+                            "mostly":    0.90,
+                        },
+                    })
+
+        return expectations
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # DISTRIBUTION ALIGNMENT (vs reference)
+    # ═══════════════════════════════════════════════════════════════════════
+
     def _check_distribution_alignment(
         self,
         new_df: pd.DataFrame,
@@ -438,7 +576,6 @@ class DataValidator:
         model_id: str,
     ) -> list[dict[str, Any]]:
         """KS alignment check — uses full columns, reports null rates."""
-        import numpy as np
         from scipy import stats
 
         results = []
@@ -448,7 +585,6 @@ class DataValidator:
             if col not in ref_df.columns:
                 continue
 
-            # Use non-null values for KS (but log what we're dropping)
             ref_vals = ref_df[col].dropna().values
             new_vals = new_df[col].dropna().values
 
@@ -463,8 +599,7 @@ class DataValidator:
                 continue
 
             try:
-                from scipy.stats._stats_py import Ks_2sampResult
-                result: Ks_2sampResult = stats.ks_2samp(ref_vals, new_vals)
+                result = stats.ks_2samp(ref_vals, new_vals)
             except Exception as exc:
                 logger.warning(f"KS test failed for '{col}': {exc}")
                 continue
@@ -498,6 +633,10 @@ class DataValidator:
             ))
 
         return results
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # SNAPSHOT / METRICS
+    # ═══════════════════════════════════════════════════════════════════════
 
     def _compute_snapshot(self, df: pd.DataFrame) -> dict[str, Any]:
         snapshot: dict[str, Any] = {
