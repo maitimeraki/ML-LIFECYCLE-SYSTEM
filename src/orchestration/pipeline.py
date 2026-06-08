@@ -864,17 +864,17 @@ with DAG(
         )
 
         # Champion version and artifact
-        champion_version = Variable.get("champion_version", default=None)
+        champion_tag_version = Variable.get("champion_tag_version", default=None)
 
-        if champion_version:
+        if champion_tag_version:
             # Get champion artifact from registry
             try:
                 registry         = ModelRegistry(model_id=MODEL_ID)
                 champion_path    = registry.get_artifact_path(
-                    MODEL_ID, champion_version
+                    MODEL_ID, champion_tag_version
                 )
             except Exception:
-                champion_version = None
+                champion_tag_version = None
                 champion_path    = None
         else:
             champion_path = None
@@ -891,11 +891,11 @@ with DAG(
             model_id=MODEL_ID,
         )
 
-        if champion_version and champion_path:
+        if champion_tag_version and champion_path:
             comparison = evaluator.compare(
-                champion_version=champion_version,
+                champion_tag_version=champion_tag_version,
                 champion_artifact_path=champion_path,
-                challenger_version=new_version,
+                challenger_tag_version=new_version,
                 challenger_artifact_path=train_xcom["artifact_path"],
                 X_eval=X_eval,
                 y_eval=y_eval,
@@ -954,7 +954,7 @@ with DAG(
             "improvement":          improvement,
             "approval_status":      approval_status,
             "new_version":          new_version,
-            "champion_version":     champion_version,
+            "champion_version":     champion_tag_version,
             "artifact_path":        train_xcom["artifact_path"],
             "metrics":              train_xcom["metrics"],
             "hyperparameters":     train_xcom["hyperparameters"],
