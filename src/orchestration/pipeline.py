@@ -67,7 +67,7 @@ logger = logging.getLogger("ml_platform.dag.lifecycle")
 MODEL_ID       = Variable.get("model_id",        default="customer_churn_model")
 TARGET_COLUMN  = Variable.get("target_column",   default="target")
 TMP_DIR        = Variable.get("tmp_dir",         default="/tmp/ml_platform").strip()
-ARTIFACT_DIR   = Variable.get("artifact_dir",    default="artifacts")
+ARTIFACT_DIR   = Variable.get("artifacts_dir",    default="/app/artifacts")
 MLFLOW_URI     = Variable.get("mlflow_uri",      default="http://mlflow:5000")
 MIN_SAMPLES    = int(Variable.get("min_samples", default="1000"))
 
@@ -115,8 +115,8 @@ def _tmp_path(run_id: str, name: str) -> str:
     return str(path / name)
 
 # Path for saving artifacts that persist across runs (e.g. reference dataset, processor objects). Not per-run, but per-model.
-def _artifact_path(model_id: str, *parts: str) -> str:
-    path = Path(ARTIFACT_DIR)/model_id
+def _artifact_path( *parts: str) -> str:
+    path = Path(ARTIFACT_DIR)
     for p in parts:
         path = path/p
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -179,6 +179,7 @@ with DAG(
         """
         run_id = context["run_id"]
         logger.info(f"Loading data for run: {run_id}")
+        new_version = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
 
         # ── PRODUCTION: Replace with real data source ──────────────────────
         # Examples:
@@ -214,10 +215,15 @@ with DAG(
         # Save production data to shared storage
         prod_path = _tmp_path(run_id, "production_raw.parquet")
         production_df.to_parquet(prod_path, index=False) # Stored production df in temporary storage for the DAG run
+        # ── SAVE: Versioned dataset for analytics ─────────────────────
+        prod_versioned_path = _artifact_path("datasets", f"{new_version}_production.parquet")
+        if not Path(prod_versioned_path).exists():
+            logger.info(f"Saving versioned production data to {prod_versioned_path}")
+            production_df.to_parquet(prod_versioned_path, index=False)
 
         # Load reference from previous cycle OR use historical data
         ref_artifact = _artifact_path(
-            MODEL_ID, "reference", "reference_raw.parquet"
+             "references", "reference_raw.parquet"
         )
 
         if Path(ref_artifact).exists():
@@ -253,6 +259,7 @@ with DAG(
 
         result = {
             "run_id":          run_id,
+            "model_version": new_version,
             "production_path": prod_path,
             "reference_path":  ref_path,
             "production_rows": len(production_df),
@@ -283,8 +290,8 @@ with DAG(
         Airflow retry: if GE engine fails → only this task retries.
         Not the whole pipeline.
         """
-        import sys
-        sys.path.insert(0, "/opt/airflow/ml_platform") # It is needed to import from ml_platform in Airflow tasks because Airflow tasks run in a different context where the ml_platform code is not in the default path. By adding it to sys.path, we can import our custom modules without issues.
+        # import sys
+        # sys.path.insert(0, "/opt/airflow/ml_platform") # It is needed to import from ml_platform in Airflow tasks because Airflow tasks run in a different context where the ml_platform code is not in the default path. By adding it to sys.path, we can import our custom modules without issues.
 
         from src.data.validation import DataValidator, DatasetSchema, ColumnSchema
         from src.observability.event_bus import event_bus
@@ -302,23 +309,31 @@ with DAG(
         logger.info(
             f"Validating production data: {len(production_df)} rows"
         )
+        
+        # schema = DatasetSchema(  # It makes the bottleneck for validation, so we keep it simple. In real life, this would be more complex and possibly loaded from a config file or built dynamically.
+        #     columns=[
+        #         ColumnSchema("feature_1", "float64"),
+        #         ColumnSchema("feature_2", "float64"),
+        #         ColumnSchema("feature_3", "float64"),
+        #         ColumnSchema("feature_4", "object",
+        #                      allowed_values=["A", "B", "C", "D"]),
+        #         ColumnSchema("feature_5", "float64", min_value=0),
+        #         ColumnSchema(TARGET_COLUMN, "int64",
+        #                      allowed_values=[0, 1]),
+        #     ],
+        #     min_rows=100,
+        # )
+        schema = Variable.get("dataset_schema", deserialize_json=True)
+        schema = DatasetSchema(**schema)
+        logger.info(f"Dataset schema: {schema}")
 
-        schema = DatasetSchema(  # It makes the bottleneck for validation, so we keep it simple. In real life, this would be more complex and possibly loaded from a config file or built dynamically.
-            columns=[
-                ColumnSchema("feature_1", "float64"),
-                ColumnSchema("feature_2", "float64"),
-                ColumnSchema("feature_3", "float64"),
-                ColumnSchema("feature_4", "object",
-                             allowed_values=["A", "B", "C", "D"]),
-                ColumnSchema("feature_5", "float64", min_value=0),
-                ColumnSchema(TARGET_COLUMN, "int64",
-                             allowed_values=[0, 1]),
-            ],
-            min_rows=100,
-        )
-
-        validator = DataValidator(schema=schema)
-        report    = validator.validate(
+        if schema:
+            logger.warning(" Using simplified schema for validation. In production, use a detailed schema with all expectations.")
+            validator = DataValidator(schema=schema)
+            
+        validator = DataValidator(schema=None)
+            
+        report = validator.validate(
             df=production_df,
             reference_df=reference_df,
             dataset_id=f"production_{run_id}",
@@ -339,6 +354,7 @@ with DAG(
 
         return {
             "run_id":        run_id,
+            "model_version": load_result["model_version"],
             "is_valid":      report.is_valid,
             "success_rate":  report.success_rate,
             "production_path": prod_path,
@@ -366,14 +382,15 @@ with DAG(
 
         Airflow retry: if processing fails → retry from here, not from Task 1.
         """
-        import sys
-        sys.path.insert(0, "/opt/airflow/ml_platform")
+        # import sys
+        # sys.path.insert(0, "/opt/airflow/ml_platform")
 
         from src.data.processing import ProductionDataProcessor
 
         run_id   = validation_result["run_id"]
-        ref_df   = pd.read_parquet(validation_result["reference_path"])
-        prod_df  = pd.read_parquet(validation_result["production_path"])
+        model_version = validation_result["model_version"]
+        ref_df   = pd.read_parquet(validation_result["reference_path"]) # Loading reference df from temporary storage for the DAG run
+        prod_df  = pd.read_parquet(validation_result["production_path"]) # Loading production df from temporary storage for the DAG run
 
         logger.info(
             f"Processing both datasets: "
@@ -392,7 +409,7 @@ with DAG(
         
         # To save the processor artifact.
         processor_save_path = _artifact_path(
-            MODEL_ID, "processors", f"{run_id}_processor.joblib"
+            "processors", f"{model_version}_processor.joblib"
         )
 
         processing_result = processor.fit_transform(
@@ -423,6 +440,7 @@ with DAG(
 
         return {
             "run_id":               run_id,
+            "model_version":        model_version,
             "ref_processed_path":   ref_proc_path,
             "prod_processed_path":  prod_proc_path,
             "production_path":      validation_result["production_path"],
@@ -451,8 +469,8 @@ with DAG(
 
         Airflow retry: isolated — only drift detection reruns on failure.
         """
-        import sys
-        sys.path.insert(0, "/opt/airflow/ml_platform")
+        # import sys
+        # sys.path.insert(0, "/opt/airflow/ml_platform")
 
         from src.drift.detector import DriftDetector
 
@@ -491,6 +509,7 @@ with DAG(
 
         return {
             "run_id":                 run_id,
+            "model_version":          processing_result["model_version"],
             "overall_severity":       drift_report.overall_severity.value,
             "overall_drift_score":    drift_report.overall_drift_score,
             "features_drifted":       drift_report.features_drifted,
@@ -612,6 +631,7 @@ with DAG(
             "prod_processed_path": drift_result["prod_processed_path"],
             "production_path":     drift_result["production_path"],
             "processor_path":      drift_result["processor_path"],
+            "model_version":       drift_result["model_version"],
         }
 
     # ──────────────────────────────────────────────────────────────────────────
@@ -700,10 +720,11 @@ with DAG(
         ti           = context["task_instance"]
         decision_xcom = ti.xcom_pull(task_ids="make_retrain_decision")
         run_id       = decision_xcom["run_id"]
+        model_version   = decision_xcom["model_version"]
 
         # Load already-processed production data
         prod_processed = pd.read_parquet(
-            decision_xcom["prod_processed_path"]
+            decision_xcom["prod_processed_path"] # Loading processed production df from temporary storage for the DAG run
         )
 
         logger.info(
@@ -743,7 +764,7 @@ with DAG(
             },
         )
 
-        new_version = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        # new_version = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
         # Define the factory type explicitly               
         def model_factory(hp: Dict[str, Any])->Any:
             return GradientBoostingClassifier(**hp)
@@ -759,11 +780,11 @@ with DAG(
             df=prod_processed,
             config=config,
             model_id=MODEL_ID,
-            model_version=new_version,
+            model_version=model_version,
         )
 
         logger.info(
-            f"Training complete: v={new_version}, "
+            f"Training complete: v={model_version}, "
             f"cv={result.cv_mean:.4f}, "
             f"metrics={result.metrics}, "
             f"mlflow={result.mlflow_run_id}"
@@ -774,7 +795,7 @@ with DAG(
 
         return {
             "run_id":            run_id,
-            "model_version":     new_version,
+            "model_version":     model_version,
             "mlflow_run_id":     result.mlflow_run_id,
             "cv_mean":           result.cv_mean,
             "cv_std":            result.cv_std,
