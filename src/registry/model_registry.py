@@ -74,7 +74,7 @@ class ModelRegistry:
     ):
         self.settings = get_settings()
         self.pipeline_run_id = pipeline_run_id
-        self.model_id = model_id or getattr(self.settings, 'model_id', 'ml_cycle_model')
+        self.model_id = model_id or getattr(self.settings, 'model_id', 'customer_churn_model')
 
         # MLflow client
         mlflow.set_tracking_uri(self.settings.mlflow.tracking_uri)
