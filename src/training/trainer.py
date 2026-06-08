@@ -130,12 +130,13 @@ class ModelTrainer:
         )
         # Check if experiment exists
         experiment = mlflow.get_experiment_by_name(self._experiment_name)
+        artifact_location = getattr(self.settings.mlflow, 'artifact_root', '/app/artifacts/mlflow')
 
         if experiment is None:
             # Create with correct artifact location
             mlflow.create_experiment(
                 name=self._experiment_name,
-                artifact_location="/tmp/mlflow-artifacts"  # ← Explicit
+                artifact_location=artifact_location
             )
         mlflow.set_experiment(self._experiment_name)
 
@@ -180,23 +181,29 @@ class ModelTrainer:
         mlflow_run_id = ""
 
         try:
-            with mlflow.start_run(run_name=f"{model_id}_{model_version}") as run:
+            with mlflow.start_run(run_name=f"{model_id}_v{model_version}") as run:
                 mlflow_run_id = run.info.run_id
 
                 # Log everything to MLflow
                 mlflow.log_params(config.hyperparameters)
-                mlflow.log_param("model_type",     config.model_type)
-                mlflow.log_param("model_version",  model_version)
-                mlflow.log_param("cv_folds",       config.cv_folds)
-                mlflow.log_param("cv_scoring",     config.cv_scoring)
-                mlflow.log_param("random_state",   config.random_state)
-                mlflow.log_param("test_size",       config.test_size)
-                mlflow.log_param("feature_count",   len(config.feature_columns))
-                mlflow.log_param("features",        ",".join(config.feature_columns))
+                # Log training config as params
+                mlflow.log_params({
+                    "model_type":     config.model_type,
+                    "model_version":  model_version,
+                    "model_id":       model_id,
+                    "cv_folds":       config.cv_folds,
+                    "cv_scoring":     config.cv_scoring,
+                    "random_state":   config.random_state,
+                    "test_size":       config.test_size,
+                    "feature_count":   len(config.feature_columns),
+                    "features":        ",".join(config.feature_columns),
+                })
 
                 for k, v in config.tags.items():
                     mlflow.set_tag(k, v)
                 mlflow.set_tag("pipeline_run_id", self.pipeline_run_id)
+                mlflow.set_tag("model_id", model_id)
+                mlflow.set_tag("model_version", model_version)
 
                 # Data hash
                 data_hash = self._compute_data_hash(df)
@@ -257,18 +264,41 @@ class ModelTrainer:
                 feature_importance = self._extract_feature_importance(
                     model, config.feature_columns
                 )
+                import os
+                artifact_base = "/app/artifacts/training"
+                os.makedirs(artifact_base, exist_ok=True)
                 if feature_importance:
                     for fname, fval in feature_importance.items():
                         mlflow.log_metric(f"importance_{fname}", fval)
+                        # Also save as JSON artifact for detailed view
+                    importance_path = f"{artifact_base}/feature_importance.json"
+                    import json
+                    with open(importance_path, "w") as f:
+                        json.dump(feature_importance, f, indent=2)
+                    mlflow.log_artifact(importance_path, artifact_path="feature_importance")
 
                 # Save model to MLflow (with signature)
                 try:
                     from mlflow.models.signature import infer_signature
                     signature = infer_signature(X_train, model.predict(X_train))
-                    mlflow.sklearn.log_model(model, name="model", signature=signature, registered_model_name=f"{model_id}")
+                    model_info = mlflow.sklearn.log_model(model, artifact_path="models", signature=signature, registered_model_name=f"{model_id}",
+                    input_sample=X_train.head(5),
+                    metadata={
+                    "model_id": model_id, 
+                    "model_version": model_version,
+                    "cv_mean": str(cv_mean),
+                    "cv_std": str(cv_std),})
+                    # Log the model URI for easy retrieval
+                    mlflow.set_tag("model_uri", model_info.model_uri)
+                    logger.info(f"Model registered: {model_info.model_uri}")
                 except Exception as e:
                     logger.warning(f"MLflow model logging failed: {e}")
-                    mlflow.sklearn.log_model(model, name="model")
+                    # Fallback: log model without registry
+                    mlflow.sklearn.log_model(
+                        sk_model=model,
+                        artifact_path="models",
+                        signature=signature if 'signature' in locals() else None,
+                    )
 
                 # Save local artifact
                 model_path = self._save_model_artifact(model, model_id, model_version)
@@ -277,6 +307,36 @@ class ModelTrainer:
                 preprocessing_path = self._save_preprocessing_artifact(
                     model_id, model_version
                 )
+                # Save training config as JSON artifact
+                config_path = f"{artifact_base}/{model_version}_training_config.json"
+                with open(config_path, "w") as f:
+                    json.dump({
+                        "model_type": config.model_type,
+                        "hyperparameters": config.hyperparameters,
+                        "feature_columns": config.feature_columns,
+                        "target_column": config.target_column,
+                        "cv_folds": config.cv_folds,
+                        "cv_scoring": config.cv_scoring,
+                        "random_state": config.random_state,
+                        "test_size": config.test_size,
+                    }, f, indent=2)
+                mlflow.log_artifact(config_path, artifact_path="training_config")
+
+                # Save metrics summary as JSON artifact
+                metrics_path = f"{artifact_base}/{model_version}_metrics_summary.json"
+                with open(metrics_path, "w") as f:
+                    json.dump({
+                        "metrics": metrics,
+                        "cv_mean": cv_mean,
+                        "cv_std": cv_std,
+                        "cv_scores": cv_scores.tolist(),
+                        "training_samples": len(X_train),
+                        "validation_samples": len(X_val),
+                        "data_hash": data_hash,
+                        "model_id": model_id,
+                        "model_version": model_version,
+                    }, f, indent=2)
+                mlflow.log_artifact(metrics_path, artifact_path="metrics")
 
                 duration = time.time() - start_time
                 mlflow.log_metric("training_duration_seconds", duration)
