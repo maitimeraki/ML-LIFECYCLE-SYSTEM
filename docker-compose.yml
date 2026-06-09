@@ -242,6 +242,7 @@ services:
       dockerfile: docker/airflow/Dockerfile
     image: ml_platform_airflow
     container_name: airflow-init
+    user: root  # ← ADD THIS: need root to chown
     environment:
       AIRFLOW__CORE__EXECUTOR: LocalExecutor
       AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres-airflow:5432/airflow
@@ -249,9 +250,10 @@ services:
       AIRFLOW__CORE__DAGS_FOLDER: /app/src/orchestration
       AIRFLOW__API__SECRET_KEY: change-me
       PYTHONPATH: /app:/app/artifacts
-      MLFLOW_TRACKING_URI: http://mlflow:5000 
+      MLFLOW_TRACKING_URI: http://mlflow:5000
     volumes:
       - shared_artifacts:/app/artifacts
+      - shared_logs:/app/logs      # ← ADD THIS: so init can fix it too
       - airflow_data:/opt/airflow
     depends_on:
       postgres-airflow:
@@ -262,11 +264,20 @@ services:
       - ml-network
     entrypoint: |
       bash -c '
-        airflow db migrate
-        airflow users create \
-          --username admin --password admin \
-          --firstname Admin --lastname User \
-          --role Admin --email admin@ml.com 2>/dev/null || true
+        mkdir -p /app/artifacts/datasets \
+                /app/artifacts/references \
+                /app/artifacts/model_registry/models \
+                /app/artifacts/processors \
+                /app/artifacts/reports \
+                /app/artifacts/mlflow/training \
+                /app/logs
+        # Fix ownership of shared volumes (root can do this)
+        chown -R 50000:0 /app/artifacts /app/logs 2>/dev/null || true
+        chmod -R g+rwX /app/artifacts /app/logs 2>/dev/null || true
+        
+        # Run Airflow commands as airflow user
+        su -s /bin/bash airflow -c "airflow db migrate"
+        su -s /bin/bash airflow -c "airflow users create --username admin --password admin --firstname Admin --lastname User --role Admin --email admin@ml.com 2>/dev/null || true"
         echo "Init complete"
       '
     restart: "no"
@@ -313,12 +324,6 @@ services:
       start_period: 120s
 
 
-  # airflow-worker:
-  #   volumes:
-  #     - shared_artifacts:/app/artifacts   # ← ADD THIS
-  #     - shared_logs:/app/logs             # ← ADD THIS too if missing
-
-
   airflow-dag-processor:
     image: ml_platform_airflow
     container_name: airflow-dag-processor
@@ -359,6 +364,7 @@ services:
       MLFLOW_TRACKING_URI: http://mlflow:5000
     volumes:
       - shared_artifacts:/app/artifacts
+      - shared_logs:/app/logs        # ← YOUR logs
       - airflow_data:/opt/airflow
     depends_on:
       postgres-airflow:
