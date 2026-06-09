@@ -25,8 +25,9 @@ COPY src/serving/        src/serving/
 
 RUN mkdir -p \
     artifacts/processors \
-    artifacts/reference \
+    artifacts/references \
     artifacts/models \
+    artifacts/datasets \
     artifacts/model_registry \
     logs
 

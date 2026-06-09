@@ -4,10 +4,8 @@ FROM apache/airflow:slim-3.2.1-python3.11
 USER root
 RUN apt-get update && apt-get install -y gcc g++ curl && rm -rf /var/lib/apt/lists/*
 # 1. Pre-create the directory structure so it exists
-RUN mkdir -p /app/artifacts
+RUN mkdir -p /app/artifacts && chown -R airflow:root /app/artifacts && chmod -R g+rwX /app/artifacts
 
-# 2. Force change ownership of /app AND everything inside it to airflow
-RUN chown -R airflow:root /app
 # Install Airflow + ML deps as airflow user
 USER airflow
 
