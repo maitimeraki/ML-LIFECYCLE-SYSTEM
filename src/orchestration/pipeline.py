@@ -323,15 +323,15 @@ with DAG(
         #     ],
         #     min_rows=100,
         # )
-        schema = Variable.get("dataset_schema", deserialize_json=True)
-        schema = DatasetSchema(**schema)
-        logger.info(f"Dataset schema: {schema}")
-
+        schema = Variable.get("dataset_schema", deserialize_json=True, default=None)
         if schema:
+            schema = DatasetSchema(**schema)
+        else:
+            schema = None
             logger.warning(" Using simplified schema for validation. In production, use a detailed schema with all expectations.")
-            validator = DataValidator(schema=schema)
             
-        validator = DataValidator(schema=None)
+        logger.info(f"Dataset schema: {schema}")
+        validator = DataValidator(schema=schema)
             
         report = validator.validate(
             df=production_df,
@@ -409,7 +409,7 @@ with DAG(
         
         # To save the processor artifact.
         processor_save_path = _artifact_path(
-            "processors", f"{model_version}_processor.joblib"
+            "processors", f"{MODEL_ID}_{model_version}_processor.joblib"
         )
 
         processing_result = processor.fit_transform(
@@ -1325,7 +1325,7 @@ with DAG(
         )
 
         # Update Airflow Variables for next cycle
-        Variable.set("champion_version", new_version)
+        Variable.set("champion_tag_version", new_version)
         Variable.set(
             "champion_f1_score",
             str(deploy_xcom["metrics"].get("f1_score", 0))
@@ -1375,7 +1375,7 @@ with DAG(
         )
 
         new_reference_path = _artifact_path(
-            MODEL_ID, "reference", f"{new_version}_reference_raw.parquet"
+            "references", f"{new_version}_reference_raw.parquet"
         )
         production_df.to_parquet(new_reference_path, index=False)
 
