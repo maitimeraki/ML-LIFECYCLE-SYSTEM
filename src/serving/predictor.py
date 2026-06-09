@@ -186,6 +186,7 @@ class ModelPredictor:
     def __init__(
         self,
         model_id:          str,
+        tag_version:       str,
         feature_columns:   list[str],
         model_dir:         Optional[Path] = None,
         processor_path:    Optional[str]  = None,
@@ -194,7 +195,8 @@ class ModelPredictor:
     ) -> None:
         self.model_id        = model_id
         self.feature_columns = feature_columns
-        self.model_dir       = model_dir or Path("models")
+        self.model_dir       = model_dir or Path("/app/artifacts/models")
+        self.tag_version     = tag_version
         self.pipeline_run_id = pipeline_run_id
 
         self._model:         Optional[Any] = None
@@ -230,7 +232,7 @@ class ModelPredictor:
         
         # NEW: Use get_champion_artifact_path() — handles MLflow + fallback
         try:
-            artifact_path, version = registry.get_champion_artifact_path(self.model_id)
+            artifact_path, version = registry.get_champion_artifact_path(self.model_id, self.tag_version)
             logger.info(f"Champion artifact resolved: {artifact_path} (v{version})")
         except Exception as e:
             raise ModelLoadError(
@@ -252,6 +254,7 @@ class ModelPredictor:
         """Load processor matching the champion version."""
         # Try to get champion metadata for pipeline_run_id
         try:
+            self.settings = get_settings()
             champion = registry.get_champion(self.model_id)
             pipeline_run_id = champion.tags.get("pipeline_run_id", "") if champion else ""
         except Exception:
@@ -260,7 +263,7 @@ class ModelPredictor:
         # Build processor path
         processor_paths = [
             # Path from champion metadata
-            Path("artifacts") / self.model_id / "processors" / f"{pipeline_run_id}_processor.joblib",
+            Path(self.settings.processors_dir) / f"{self.model_id}_{self.tag_version}_processor.joblib",
             # Fallback: version-based naming
             Path("artifacts") / self.model_id / "processors" / f"{version}_processor.joblib",
             # Fallback: latest processor

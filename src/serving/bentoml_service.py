@@ -17,14 +17,12 @@ Endpoints:
   POST /model/reload      → hot-swap champion (no restart)
 """
 from __future__ import annotations
-
+import os
 import logging
 import uuid
 from typing import Any, Optional
 
 import bentoml
-import numpy as np
-import pandas as pd
 from pydantic import BaseModel, Field
 
 from config.settings import get_settings
@@ -38,8 +36,8 @@ logger = logging.getLogger("ml_platform.serving.bentoml")
 # Wire Prometheus handler once at module load
 register_prometheus_handler(event_bus)
 
-MODEL_ID = get_settings().model_id if hasattr(get_settings(), "model_id") else "customer_churn_model"
-
+MODEL_ID = os.environ.get("MODEL_ID", "customer_churn_model")
+TAG_VERSION = os.environ.get("TAG_VERSION", "20260609_155056")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Schemas
@@ -103,6 +101,7 @@ class MLPlatformService:
         self.settings  = get_settings()
         self.predictor = ModelPredictor(
             model_id=MODEL_ID,
+            tag_version=TAG_VERSION,
             model_dir=self.settings.models_dir,
             feature_columns=[],   # Managed by processor
             cache_size=10_000,
@@ -126,14 +125,14 @@ class MLPlatformService:
         input_spec=PredictInput ,    # Fixed: Wrapped in JSON descriptor
         output_spec=PredictOutput,  # Fixed: Wrapped in JSON descriptor
     )
-    def predict(self, features: dict[str, Any], request_id:str) -> PredictOutput:
+    def predict(self, features: dict[str, Any], request_id:str, return_probabilities : bool=False) -> PredictOutput:
         """Single prediction with caching and monitoring."""
         request_id = request_id or str(uuid.uuid4())
 
         request = PredictionRequest(
             request_id=request_id,
             features=features,
-            return_probabilities=False,
+            return_probabilities=return_probabilities,
         )
 
         response = self.predictor.predict(request)
