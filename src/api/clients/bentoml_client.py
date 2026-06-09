@@ -146,19 +146,19 @@ class BentoMLClient:
 
     async def model_info(self) -> dict[str, Any]:
         """Get champion model metadata from BentoML."""
-        response = await self._client.get("/model/info")
+        response = await self._client.post("/model/info")
         response.raise_for_status()
         return response.json()
 
     async def serving_metrics(self) -> dict[str, Any]:
         """Get serving metrics from BentoML predictor."""
-        response = await self._client.get("/model/metrics")
+        response = await self._client.post("/model/metrics")
         response.raise_for_status()
         return response.json()
 
     async def health(self) -> dict[str, Any]:
         """Check BentoML service health."""
-        response = await self._client.get("/health")
+        response = await self._client.post("/health")
         response.raise_for_status()
         return response.json()
 
