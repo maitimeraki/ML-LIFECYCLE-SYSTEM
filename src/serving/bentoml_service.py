@@ -188,7 +188,7 @@ class MLPlatformService:
                 "message": str(exc),
             }
 
-    @bentoml.api(route="/model/info")
+    @bentoml.api(route="/model/info", input_spec=None, output_spec=None)
     def model_info(self) -> dict[str, Any]:
         """Current champion metadata from registry."""
         try:
