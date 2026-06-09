@@ -16,9 +16,11 @@ from pathlib import Path
 from typing import Any, Optional
 
 import mlflow
+import mlflow.exceptions
+import requests
 from mlflow.tracking import MlflowClient
 
-from config.settings import get_settings
+from config.settings import get_settings, Environment
 from src.common.exceptions import ModelRegistryError, ModelNotFoundError
 from src.observability.event_bus import EventType, event_bus, make_event
 from src.observability.metrics import CHAMPION_METRIC, MODEL_INFO
@@ -98,15 +100,64 @@ class ModelRegistry:
     # MLflow connectivity
     # ─────────────────────────────────────────────────────────────────────────
 
+    from src.common.exceptions import ModelRegistryError
+
     def _check_mlflow_connection(self) -> bool:
-        """Test MLflow connectivity without failing."""
+        """
+        Test MLflow connectivity.
+        
+        Raises:
+            ModelRegistryError: If MLflow is configured but unreachable
+                                        (network, auth, TLS, DNS errors).
+            Returns False only if MLflow is intentionally disabled.
+        """
+        # Check if MLflow is intentionally disabled
+        if not self.settings.mlflow.tracking_uri:
+            logger.info("MLflow tracking URI not configured, using file-only mode")
+            return False
+        
         try:
             self.mlflow_client.search_registered_models()
             logger.info("MLflow registry connected")
             return True
+            
+        except mlflow.exceptions.MlflowException as e:
+            # MLflow-specific errors: server down, bad request, etc.
+            error_msg = f"MLflow server error: {e}"
+            logger.error(error_msg)
+            
+            if self.settings.environment == Environment.PRODUCTION:
+                # Production: fail fast — stale models are dangerous
+                raise ModelRegistryError(
+                    error_msg,
+                    details={"tracking_uri": self.settings.mlflow.tracking_uri},
+                ) from e
+            else:
+                # Development: allow fallback for local testing
+                logger.warning("Using file fallback (dev mode)")
+                return False
+                
+        except requests.exceptions.ConnectionError as e:
+            # Network-level: DNS, TCP, timeout
+            error_msg = f"Cannot connect to MLflow at {self.settings.mlflow.tracking_uri}: {e}"
+            logger.error(error_msg)
+            
+            raise ModelRegistryError(
+                error_msg,
+                details={"tracking_uri": self.settings.mlflow.tracking_uri},
+            ) from e
+            
         except Exception as e:
-            logger.warning(f"MLflow unavailable, using file fallback: {e}")
-            return False
+            # Unknown errors — log full stack trace, then decide
+            logger.exception(f"Unexpected MLflow error: {e}")
+            
+            if self.settings.environment == Environment.PRODUCTION:
+                raise ModelRegistryError(
+                    f"Unexpected MLflow error: {e}",
+                    details={"tracking_uri": self.settings.mlflow.tracking_uri},
+                ) from e
+            else:
+                return False
 
     def _refresh_mlflow_state(self, model_id: str) -> None:
         """Sync MLflow state to local cache."""
