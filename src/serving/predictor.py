@@ -405,6 +405,7 @@ class ModelPredictor:
 
             if request.return_probabilities and hasattr(model, "predict_proba"):
                 proba = model.predict_proba(X)[0]
+                logger.info(f"Predicted probabilities: {proba}")
                 if hasattr(model, "classes_"):
                     probabilities = {
                         str(cls): float(p)
