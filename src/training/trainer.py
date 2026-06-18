@@ -265,23 +265,16 @@ class ModelTrainer:
                     model, config.feature_columns
                 )
                 import os
-                artifact_base = "/app/artifacts/mlflow/training"
-                os.makedirs(artifact_base, exist_ok=True)
                 if feature_importance:
                     for fname, fval in feature_importance.items():
                         mlflow.log_metric(f"importance_{fname}", fval)
-                        # Also save as JSON artifact for detailed view
-                    importance_path = f"{artifact_base}/{model_version}_feature_importance.json"
-                    import json
-                    with open(importance_path, "w") as f:
-                        json.dump(feature_importance, f, indent=2)
-                    mlflow.log_artifact(importance_path, artifact_path="feature_importance")
+                        
 
                 # Save model to MLflow (with signature)
                 try:
                     from mlflow.models.signature import infer_signature
                     signature = infer_signature(X_train, model.predict(X_train))
-                    model_info = mlflow.sklearn.log_model(model, artifact_path="models", signature=signature, registered_model_name=f"{model_id}",
+                    model_info = mlflow.sklearn.log_model(model, artifact_path="model", signature=signature, registered_model_name=f"{model_id}",
                     input_sample=X_train.head(5),
                     metadata={
                     "model_id": model_id, 
@@ -296,19 +289,26 @@ class ModelTrainer:
                     # Fallback: log model without registry
                     mlflow.sklearn.log_model(
                         sk_model=model,
-                        artifact_path="models",
+                        artifact_path="model",
                         signature=signature if 'signature' in locals() else None,
                     )
+                # Stored artifacts at local path (for registry) - MLflow also has its own artifact storage    
+                artifact_base = f"/app/artifacts/training"
+                os.makedirs(artifact_base, exist_ok=True)
+                # 1. Save feature importance as JSON artifact
+                importance_path = f"{artifact_base}/{model_id}_{model_version}_feature_importance.json"
+                import json
+                with open(importance_path, "w") as f:
+                    json.dump(feature_importance, f, indent=2)
 
                 # Save local artifact
-                model_path = self._save_model_artifact(model, model_id, model_version)
-                mlflow.log_artifact(model_path, artifact_path="models")
+                self._save_model_artifact(model, model_id, model_version)
 
                 preprocessing_path = self._save_preprocessing_artifact(
                     model_id, model_version
                 )
                 # Save training config as JSON artifact
-                config_path = f"{artifact_base}/{model_version}_training_config.json"
+                config_path = f"{artifact_base}/{model_id}_{model_version}_training_config.json"
                 with open(config_path, "w") as f:
                     json.dump({
                         "model_type": config.model_type,
@@ -320,10 +320,9 @@ class ModelTrainer:
                         "random_state": config.random_state,
                         "test_size": config.test_size,
                     }, f, indent=2)
-                mlflow.log_artifact(config_path, artifact_path="training_config")
 
                 # Save metrics summary as JSON artifact
-                metrics_path = f"{artifact_base}/{model_version}_metrics_summary.json"
+                metrics_path = f"{artifact_base}/{model_id}_{model_version}_metrics_summary.json"
                 with open(metrics_path, "w") as f:
                     json.dump({
                         "metrics": metrics,
@@ -336,7 +335,6 @@ class ModelTrainer:
                         "model_id": model_id,
                         "model_version": model_version,
                     }, f, indent=2)
-                mlflow.log_artifact(metrics_path, artifact_path="metrics")
 
                 duration = time.time() - start_time
                 mlflow.log_metric("training_duration_seconds", duration)
