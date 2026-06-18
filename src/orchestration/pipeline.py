@@ -1,4 +1,3 @@
-# dags/ml_lifecycle_dag.py
 """
 ML Lifecycle Pipeline — Airflow DAG.
 
@@ -74,7 +73,7 @@ MIN_SAMPLES    = int(Variable.get("min_samples", default="1000"))
 DEFAULT_ARGS = {
     "owner":             "ml-platform",
     "depends_on_past":   False,
-    "email":             ["ml-alerts@company.com"],
+    "email":             ["maitianupam567@gmail.com"],
     "email_on_failure":  True,
     "email_on_retry":    False,
     "retries":           2,
@@ -164,108 +163,142 @@ with DAG(
 
     # ──────────────────────────────────────────────────────────────────────────
     # TASK 1: Load Data
-    # Airflow responsibility: pull data from warehouse/S3
+    # Airflow responsibility: pull data from warehouse/S3/database
     # Returns: file paths via XCom (not the data itself)
     # ──────────────────────────────────────────────────────────────────────────
 
     @airflow_task(task_id="load_data")
     def load_data(**context) -> dict[str, Any]:
         """
-        Load production data from data warehouse.
-        Load reference data from previous cycle's saved artifact.
+        Load production and reference data from configurable sources.
 
-        Returns metadata + file paths via XCom.
-        DataFrames saved to shared temp storage (not XCom — too large).
+        Supports multiple formats (CSV, Excel, Parquet, JSON, Feather, ORC)
+        and sources (local, S3/GCS/Azure via fsspec, databases via SQLAlchemy).
+
+        Configuration via DAG params (with Airflow Variable fallback):
+        - production_source: path or connection string
+        - production_format: optional explicit format (auto-detected from extension)
+        - production_sql_query: SQL query for database sources
+        - production_sql_params: parameters for SQL query
+        - production_read_kwargs: extra args for pd.read_*
+        - reference_source: path or connection string for reference data
+        - reference_format: optional explicit format
+        - reference_sql_query: SQL query for reference database
+        - reference_sql_params: parameters for reference SQL query
+        - reference_read_kwargs: extra args for reference read
+
+        Falls back to synthetic data generation if no source configured.
         """
+        from src.data.loader import DataSourceConfig, load_data as universal_load, save_data
+
         run_id = context["run_id"]
         logger.info(f"Loading data for run: {run_id}")
         new_version = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
 
-        # ── PRODUCTION: Replace with real data source ──────────────────────
-        # Examples:
-        #   df = pd.read_parquet("s3://bucket/production/2024-01/*.parquet")
-        #   df = spark_client.sql("SELECT * FROM feature_store WHERE dt=today")
-        #   df = bigquery_client.query("SELECT * FROM ml_features LIMIT 100000")
-        # ──────────────────────────────────────────────────────────────────────
+        # ── Get configuration from DAG params with Variable fallback ─────────
+        dag_params = context.get("params", {}) or {}
 
-        drift_level = float(
-            Variable.get("drift_simulation_level", default="0.3")
-        )
+        def _get_config(prefix: str) -> dict[str, Any]:
+            """Extract config for a data source from params/Variables."""
+            config = {}
+            # DAG params take precedence
+            for key in ["source", "format", "sql_query", "sql_params", "read_kwargs", "chunk_size"]:
+                param_key = f"{prefix}_{key}"
+                if param_key in dag_params:
+                    config[key] = dag_params[param_key]
+            # Fallback to Airflow Variables
+            for key in ["source", "format", "sql_query", "sql_params", "read_kwargs", "chunk_size"]:
+                var_key = f"{prefix}_{key}"
+                if key not in config:
+                    val = Variable.get(var_key, default=None)
+                    if val is not None:
+                        # Parse JSON for complex types
+                        if key in {"sql_params", "read_kwargs"} and isinstance(val, str):
+                            import json
+                            try:
+                                config[key] = json.loads(val)
+                            except json.JSONDecodeError:
+                                config[key] = val
+                        else:
+                            config[key] = val
+            return config
 
-        rng_prod = np.random.RandomState(
-            int(datetime.now().timestamp()) % 100000
-        )
-        n_prod = int(Variable.get("production_sample_size", default="2000"))
+        prod_config_dict = _get_config("production") # Return Format: { "source": ..., "format": ..., "sql_query": ..., "sql_params": ..., "read_kwargs": ... }
+        ref_config_dict = _get_config("reference")
 
-        production_df = pd.DataFrame({
-            "feature_1": rng_prod.normal(10 + drift_level, 2, n_prod),
-            "feature_2": rng_prod.normal(5 + drift_level * 0.5, 1.5, n_prod),
-            "feature_3": rng_prod.exponential(2 + drift_level * 0.3, n_prod),
-            "feature_4": rng_prod.choice(["A", "B", "C", "D"], n_prod),
-            "feature_5": rng_prod.uniform(0, 100 + drift_level * 15, n_prod),
-        })
-        logits             = (
-            0.3 * production_df["feature_1"]
-            - 0.5 * production_df["feature_2"]
-        )
-        production_df[TARGET_COLUMN] = (
-            logits > logits.median()
-        ).astype(int) # Creation of the target columns of produciton df
+        # ── Load Production Data ─────────────────────────────────────────────
+        if prod_config_dict.get("source"):
+            logger.info(f"Loading production data from configured source: {prod_config_dict['source']}")
+            prod_config = DataSourceConfig.from_dict(prod_config_dict)
+            production_df = universal_load(prod_config) # Return Type: pd.DataFrame
+        else:
+            # Fallback: synthetic data generation (for testing/backward compatibility)
+            logger.info("No production source configured, generating synthetic data")
+            drift_level = float(Variable.get("drift_simulation_level", default="0.3"))
+            rng_prod = np.random.RandomState(int(datetime.now().timestamp()) % 100000)
+            n_prod = int(Variable.get("production_sample_size", default="2000"))
 
-        # Save production data to shared storage
+            production_df = pd.DataFrame({
+                "feature_1": rng_prod.normal(10 + drift_level, 2, n_prod),
+                "feature_2": rng_prod.normal(5 + drift_level * 0.5, 1.5, n_prod),
+                "feature_3": rng_prod.exponential(2 + drift_level * 0.3, n_prod),
+                "feature_4": rng_prod.choice(["A", "B", "C", "D"], n_prod),
+                "feature_5": rng_prod.uniform(0, 100 + drift_level * 15, n_prod),
+            })
+            logits = 0.3 * production_df["feature_1"] - 0.5 * production_df["feature_2"]
+            production_df[TARGET_COLUMN] = (logits > logits.median()).astype(int)
+
+        # Save production data to shared storage (always parquet for pipeline)
         prod_path = _tmp_path(run_id, "production_raw.parquet")
-        production_df.to_parquet(prod_path, index=False) # Stored production df in temporary storage for the DAG run
-        # ── SAVE: Versioned dataset for analytics ─────────────────────
+        save_data(production_df, prod_path, format="parquet")
+
+        # ── SAVE: Versioned dataset for analytics ────────────────────────────
         prod_versioned_path = _artifact_path("datasets", f"{new_version}_production.parquet")
         if not Path(prod_versioned_path).exists():
             logger.info(f"Saving versioned production data to {prod_versioned_path}")
-            production_df.to_parquet(prod_versioned_path, index=False)
+            save_data(production_df, prod_versioned_path, format="parquet")
 
-        # Load reference from previous cycle OR use historical data
-        ref_artifact = _artifact_path(
-             "references", "reference_raw.parquet"
-        )
-
-        if Path(ref_artifact).exists():
-            reference_df = pd.read_parquet(ref_artifact)
-            ref_source   = "previous_cycle"
-            logger.info(
-                f"Reference loaded from previous cycle: "
-                f"{len(reference_df)} rows"
-            )
+        # ── Load Reference Data ──────────────────────────────────────────────
+        if ref_config_dict.get("source"):
+            logger.info(f"Loading reference data from configured source: {ref_config_dict['source']}")
+            ref_config = DataSourceConfig.from_dict(ref_config_dict)
+            reference_df = universal_load(ref_config)
+            ref_source = "configured"
         else:
-            # First run: use historical data. Use else to avoid accidentally using old reference after first run. Because after first run, reference will be saved to artifact path and should be used for next runs.
-            rng_ref    = np.random.default_rng()
-            n_ref      = 10000
-            reference_df = pd.DataFrame({
-                "feature_1": rng_ref.normal(10, 2, n_ref),
-                "feature_2": rng_ref.normal(5, 1.5, n_ref),
-                "feature_3": rng_ref.exponential(2, n_ref),
-                "feature_4": rng_ref.choice(["A", "B", "C", "D"], n_ref),
-                "feature_5": rng_ref.uniform(0, 100, n_ref),
-            })
-            ref_logits         = (
-                0.3 * reference_df["feature_1"]
-                - 0.5 * reference_df["feature_2"]
-            )
-            reference_df[TARGET_COLUMN] = (
-                ref_logits > ref_logits.median()
-            ).astype(int)
-            ref_source = "historical_initial"
-            logger.info("First run: using historical reference data")
+            # Fallback: load from previous cycle artifact or generate synthetic
+            ref_artifact = _artifact_path("references", "reference_raw.parquet")
+
+            if Path(ref_artifact).exists():
+                logger.info(f"Loading reference from previous cycle artifact: {ref_artifact}")
+                reference_df = pd.read_parquet(ref_artifact)
+                ref_source = "previous_cycle"
+            else:
+                # First run: synthetic historical data
+                logger.info("First run: generating synthetic historical reference data")
+                rng_ref = np.random.default_rng()
+                n_ref = 10000
+                reference_df = pd.DataFrame({
+                    "feature_1": rng_ref.normal(10, 2, n_ref),
+                    "feature_2": rng_ref.normal(5, 1.5, n_ref),
+                    "feature_3": rng_ref.exponential(2, n_ref),
+                    "feature_4": rng_ref.choice(["A", "B", "C", "D"], n_ref),
+                    "feature_5": rng_ref.uniform(0, 100, n_ref),
+                })
+                ref_logits = 0.3 * reference_df["feature_1"] - 0.5 * reference_df["feature_2"]
+                reference_df[TARGET_COLUMN] = (ref_logits > ref_logits.median()).astype(int)
+                ref_source = "historical_initial"
 
         ref_path = _tmp_path(run_id, "reference_raw.parquet")
-        reference_df.to_parquet(ref_path, index=False)
+        save_data(reference_df, ref_path, format="parquet")
 
         result = {
-            "run_id":          run_id,
+            "run_id": run_id,
             "model_version": new_version,
             "production_path": prod_path,
-            "reference_path":  ref_path,
+            "reference_path": ref_path,
             "production_rows": len(production_df),
-            "reference_rows":  len(reference_df),
+            "reference_rows": len(reference_df),
             "reference_source": ref_source,
-            "drift_level":     drift_level,
         }
 
         logger.info(
