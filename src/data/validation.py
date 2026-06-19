@@ -34,6 +34,7 @@ class ColumnSchema:
     name: str
     dtype: str
     nullable: bool = True
+    unique: bool = False
     min_value: Optional[float] = None
     max_value: Optional[float] = None
     allowed_values: Optional[list] = None
@@ -100,12 +101,12 @@ class DataValidator:
         expectations: Optional[list[dict[str, Any]]] = None,
     ) -> ValidationReport:
         """
-        Validate a DataFrame and emit observable events.
+        Validate PRODUCTION data against expectations derived from REFERENCE data.
         
-        Mode selection:
-          - If expectations list provided → use those directly
-          - Elif schema provided → build from schema
-          - Else → auto-profile from data
+        Modes:
+        1. Pre-built expectations provided → use directly (production)
+        2. Reference data provided → build expectations from reference, validate production
+        3. Neither → auto-profile from production (fallback, NOT recommended for prod)
         """
         suite_name = f"{model_id or 'dataset'}_{dataset_id}"
 
@@ -154,18 +155,20 @@ class DataValidator:
 
             # ── MODE SELECTION: explicit → schema → auto-profile ──────────
             if expectations is not None:
-                # Mode 1: Caller provided explicit expectations
+                 # PRODUCTION MODE: Use pre-built expectations (from reference data)
                 expectations_to_run = expectations
                 logger.info(f"Using {len(expectations)} caller-provided expectations")
                 
             elif self.schema is not None:
-                # Mode 2: Build from DatasetSchema
-                expectations_to_run = self._build_expectations_from_schema(df)
+                 # FALLBACK: Build expectations from REFERENCE dataschema, not production
+                expectations_to_run = self._build_expectations_from_schema(self.schema)
                 logger.info(f"Schema-driven: {len(expectations_to_run)} expectations from schema")
                 
             else:
+                if reference_df is None:
+                    raise FileNotFoundError("Referenced dataset is not provide. If you have not provide expectations or dataschema then should provide referenced dataset.")
                 # Mode 3: Auto-profile — no schema, infer from data
-                expectations_to_run = self._auto_profile_expectations(df)
+                expectations_to_run = self._auto_profile_expectations(reference_df)
                 logger.info(f"Auto-profile: {len(expectations_to_run)} expectations inferred")
 
             # Add all expectations to suite
@@ -338,131 +341,101 @@ class DataValidator:
             return None
 
     def _build_expectations_from_schema(
-        self, df: pd.DataFrame
+        self, schema: DatasetSchema
     ) -> list[dict[str, Any]]:
         """
-        SCHEMA-DRIVEN MODE: Generate expectations from explicit DatasetSchema.
-        Uses schema rules + observed data for ranges.
+        SCHEMA-DRIVEN MODE: Generate expectations purely from explicit DatasetSchema.
+        
+        Args:
+            schema: The DatasetSchema defining columns, types, constraints
+            reference_df: Optional reference data for statistical profiling 
+                        (ranges, means, categories). If None, uses schema defaults.
+        
+        Returns:
+            List of Great Expectations expectation dictionaries
         """
         expectations: list[dict[str, Any]] = []
 
-        # Table-level expectations
+        # ── Table-level expectations from schema ──────────────────────────
         expectations.append({
             "expectation_type": "ExpectTableRowCountToBeBetween",
             "kwargs": {
-                "min_value": self.schema.min_rows if self.schema else 100,
-                "max_value": self.schema.max_rows if self.schema else None,
+                "min_value": schema.min_rows,
+                "max_value": schema.max_rows,
             },
         })
+
+        # Column set validation
+        column_names = [c.name for c in schema.columns if schema]
         expectations.append({
             "expectation_type": "ExpectTableColumnsToMatchSet",
             "kwargs": {
-                "column_set":   list(df.columns),
-                "exact_match":  True,
+                "column_set":  column_names,
+                "exact_match": True,
             },
         })
 
-        # Map schema columns by name
-        schema_map = (
-            {c.name: c for c in self.schema.columns}
-            if self.schema else {}
-        )
+        # Build schema column map
+        schema_map = {c.name: c for c in schema.columns}
 
-        for col in df.columns:
-            col_schema = schema_map.get(col)
-            total      = len(df)
-            null_count = int(df[col].isnull().sum())
+        for col_schema in schema.columns:
+            col_name = col_schema.name
+             # ── Null handling ─────────────────────────────────────────────────
+            if not col_schema.nullable:
+                expectations.append({
+                    "expectation_type": "ExpectColumnValuesToNotBeNull",
+                    "kwargs": {"column": col_name, "mostly": 1.0},
+                })
+            else:
+                # If nullable, allow some nulls (schema-driven default)
+                expectations.append({
+                    "expectation_type": "ExpectColumnValuesToNotBeNull",
+                    "kwargs": {"column": col_name, "mostly": 0.95},
+                })
 
-            # ── Null handling ─────────────────────────────────────────────
-            null_rate    = null_count / total if total > 0 else 0.0
-            null_budget  = min(null_rate + 0.05, 0.30)
-            mostly_valid = round(1.0 - null_budget, 4)
+            # ── Data type expectation ─────────────────────────────────────────
+            if col_schema.dtype:
+                expectations.append({
+                    "expectation_type": "ExpectColumnValuesToBeOfType",
+                    "kwargs": {
+                        "column": col_name,
+                        "type_":  col_schema.dtype,
+                    },
+                })
 
-            if null_count == total:
-                logger.warning(f"Column '{col}' is 100% null, skipping.")
-                continue
-
-            if col_schema and not col_schema.nullable:
-                mostly_valid = 1.0  # Strict: no nulls allowed
-
-            expectations.append({
-                "expectation_type": "ExpectColumnValuesToNotBeNull",
-                "kwargs": {"column": col, "mostly": mostly_valid},
-            })
-
-            # ── Allowed values (from schema) ──────────────────────────────
-            if col_schema and col_schema.allowed_values:
+            # ── Allowed values (schema enum) ──────────────────────────────────
+            if col_schema.allowed_values:
                 expectations.append({
                     "expectation_type": "ExpectColumnValuesToBeInSet",
                     "kwargs": {
-                        "column":    col,
+                        "column":    col_name,
                         "value_set": col_schema.allowed_values,
-                        "mostly":    0.99,
+                        "mostly":    1.0,
                     },
                 })
 
-            # ── Numeric columns: ranges + stats ───────────────────────────
-            elif pd.api.types.is_numeric_dtype(df[col]):
-                non_null = df[col].dropna()
-                if len(non_null) < 5:
-                    continue
+            # ── Numeric range expectations ────────────────────────────────────
+            if col_schema.dtype in ("int", "float", "int64", "float64"):
+                
+                # Priority: schema explicit values > reference data stats > defaults
+                if col_schema.min_value is not None and col_schema.max_value is not None:
+                    # Schema provides explicit range
+                    expectations.append({
+                        "expectation_type": "ExpectColumnValuesToBeBetween",
+                        "kwargs": {
+                            "column":    col_name,
+                            "min_value": col_schema.min_value,
+                            "max_value": col_schema.max_value,
+                            "mostly":    1.0,
+                        },
+                    })
 
-                desc    = non_null.describe()
-                col_min = float(desc["min"])
-                col_max = float(desc["max"])
-                col_mean = float(desc["mean"])
-
-                # Schema overrides auto-profile
-                range_min = (
-                    col_schema.min_value 
-                    if (col_schema and col_schema.min_value is not None)
-                    else (col_min * 1.5 if col_min < 0 else col_min * 0.5)
-                )
-                range_max = (
-                    col_schema.max_value 
-                    if (col_schema and col_schema.max_value is not None)
-                    else (col_max * 1.5 if col_max > 0 else col_max * 0.5)
-                )
-
-                if range_min > range_max:
-                    range_min, range_max = range_max, range_min
-
+            # ── Uniqueness ────────────────────────────────────────────────────
+            if col_schema.unique:
                 expectations.append({
-                    "expectation_type": "ExpectColumnValuesToBeBetween",
-                    "kwargs": {
-                        "column":    col,
-                        "min_value": round(range_min, 6),
-                        "max_value": round(range_max, 6),
-                        "mostly":    0.99,
-                    },
+                    "expectation_type": "ExpectColumnValuesToBeUnique",
+                    "kwargs": {"column": col_name},
                 })
-
-                if col_mean != 0:
-                    expectations.append({
-                        "expectation_type": "ExpectColumnMeanToBeBetween",
-                        "kwargs": {
-                            "column":    col,
-                            "min_value": round(col_mean * 0.5, 6),
-                            "max_value": round(col_mean * 1.5, 6),
-                        },
-                    })
-
-            # ── Categorical columns ───────────────────────────────────────
-            elif df[col].dtype in ("object", "category"):
-                unique_count = df[col].nunique(dropna=True)
-                if 0 < unique_count <= 50:
-                    top_cats = (
-                        df[col].value_counts(normalize=True, dropna=True)
-                        .head(20).index.tolist()
-                    )
-                    expectations.append({
-                        "expectation_type": "ExpectColumnValuesToBeInSet",
-                        "kwargs": {
-                            "column":    col,
-                            "value_set": top_cats,
-                            "mostly":    0.95,
-                        },
-                    })
 
         return expectations
 
@@ -533,7 +506,7 @@ class DataValidator:
                         "column":    col,
                         "min_value": round(range_min, 4),
                         "max_value": round(range_max, 4),
-                        "mostly":    0.95,
+                        "mostly":    0.95, # acts as a tolerance threshold for data quality.If 96% of your rows are within the range, the test returns Success: True.
                     },
                 })
 
@@ -586,8 +559,8 @@ class DataValidator:
             if col not in ref_df.columns:
                 continue
 
-            ref_vals = ref_df[col].dropna().values
-            new_vals = new_df[col].dropna().values
+            ref_vals = np.asarray(ref_df[col].dropna().values)
+            new_vals = np.asarray(new_df[col].dropna().values)
 
             ref_null_rate = ref_df[col].isnull().mean()
             new_null_rate = new_df[col].isnull().mean()
@@ -604,34 +577,61 @@ class DataValidator:
             except Exception as exc:
                 logger.warning(f"KS test failed for '{col}': {exc}")
                 continue
+            # ── NEW: Combined decision using effect size + p-value ─────────
+            ks_stat = float(result.statistic)
+            p_value = float(result.pvalue)
 
-            aligned = (result.pvalue) > 0.01
-            entry   = {
+            # Effect size thresholds (Cohen's conventions adapted for KS D):
+            # D < 0.05: negligible, 0.05-0.1: small, 0.1-0.2: medium, >0.2: large
+            DRIFT_THRESHOLDS = {
+                "negligible": 0.05,
+                "small": 0.10,
+                "medium": 0.20,
+                "large": 0.30,
+            }
+            
+            # Drift detected ONLY if p < 0.01 AND effect size is meaningful
+            if p_value < 0.01 and ks_stat > DRIFT_THRESHOLDS["small"]:
+                aligned = False
+                severity = "warning" if ks_stat < DRIFT_THRESHOLDS["medium"] else "error"
+            elif p_value < 0.01 and ks_stat <= DRIFT_THRESHOLDS["small"]:
+                # Statistically significant but practically negligible
+                aligned = True
+                severity = "info"
+            else:
+                aligned = True
+                severity = "info"
+
+            entry = {
                 "column":        col,
                 "test":          "ks_2samp",
-                "ks_stat":       round(float(result.statistic), 4),
-                "p_value":       round(float(result.pvalue), 6),
+                "ks_stat":       round(ks_stat, 4),
+                "p_value":       round(p_value, 6),
                 "aligned":       aligned,
-                "ref_null_rate": round(float(ref_null_rate), 4),
-                "new_null_rate": round(float(new_null_rate), 4),
+                "drift_severity": severity,
+                "ref_mean":      round(float(ref_vals.mean()), 4),
+                "new_mean":      round(float(new_vals.mean()), 4),
+                "mean_diff_pct": round(abs(ref_vals.mean() - new_vals.mean()) / abs(ref_vals.mean()) * 100, 2) if ref_vals.mean() != 0 else None,
             }
             results.append(entry)
 
-            event_bus.emit(make_event(
-                pipeline_run_id=pipeline_run_id,
-                event_type=EventType.GE_EXPECTATION_CHECKED,
-                step_name="data_validation",
-                title=f"{'✅' if aligned else '⚠️'} Distribution: {col}",
-                message=(
-                    f"KS '{col}': p={float(result.pvalue):.4f} — "
-                    f"{'aligned' if aligned else 'DRIFT DETECTED'}"
-                ),
-                framework=self.FRAMEWORK,
-                status="success" if aligned else "warning",
-                severity="info" if aligned else "warning",
-                model_id=model_id,
-                data=entry,
-            ))
+            # Only emit warning events for REAL drift
+            if not aligned:
+                event_bus.emit(make_event(
+                    pipeline_run_id=pipeline_run_id,
+                    event_type=EventType.GE_EXPECTATION_CHECKED,
+                    step_name="data_validation",
+                    title=f"⚠️ Distribution Drift: {col}",
+                    message=(
+                        f"KS '{col}': D={ks_stat:.4f}, p={p_value:.4f} — "
+                        f"Mean shifted by {entry['mean_diff_pct']}%"
+                    ),
+                    framework=self.FRAMEWORK,
+                    status="warning",
+                    severity=severity,
+                    model_id=model_id,
+                    data=entry,
+                ))
 
         return results
 
