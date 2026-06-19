@@ -23,10 +23,11 @@
 - [Architecture Overview](#architecture-overview)
 - [Project Structure](#project-structure)
 - [How It Works: Complete Lifecycle](#how-it-works-complete-lifecycle)
+- [Pipeline Execution](#pipeline-execution)
+- [Monitoring & Observability](#monitoring--observability)
 - [Quick Start Guide](#quick-start-guide)
 - [Configuration](#configuration)
 - [API Reference](#api-reference)
-- [Monitoring & Observability](#monitoring--observability)
 - [Deployment Strategies](#deployment-strategies)
 - [Troubleshooting](#troubleshooting)
 - [Contributing](#contributing)
@@ -35,7 +36,7 @@
 
 ## What is This?
 
-**ML Lifecycle System** is an integrated framework that manages the **entire lifespan** of a machine learning model in production—from data validation through serving and continuous monitoring. It automates critical decisions, prevents model degradation, and ensures reliable predictions at scale.
+**ML Lifecycle System** is an integrated framework that manages the **entire lifespan** of a machine learning model in production—from data validation through serving and continuous monitoring.
 
 ### Problem It Solves
 
@@ -101,9 +102,9 @@ The system is built on three core principles:
 ## Architecture Overview
 
 ```
-┌────────────────────────────────────────────────────────────────────┐
+┌─────────────────────────────────────────────────────────────────────┐
 │                    PRODUCTION ML LIFECYCLE                         │
-└────────────────────────────────────────────────────────────────────┘
+└─────────────────────────────────────────────────────────────────────┘
 
                              Data In
                                 ▼
@@ -452,6 +453,123 @@ Serves predictions in real-time. Every prediction logged for monitoring. Metrics
 
 ---
 
+## Pipeline Execution
+
+### Airflow DAG Orchestration
+
+The complete ML lifecycle is orchestrated through Apache Airflow DAGs that manage task dependencies, retries, and monitoring.
+
+**Pipeline Run Status (Production Success):**
+
+<div align="center">
+
+![Airflow DAG Run Status](https://i.imgur.com/scheduled_2026-06-09T00_00_00.png)
+
+| Metric | Value |
+|--------|-------|
+| **Status** | ✅ Success |
+| **Run Type** | Scheduled |
+| **Duration** | 00:01:26 |
+| **Start Date** | 2026-06-09 05:30:00 |
+| **Run Date** | 2026-06-09 21:20:52 |
+| **End Date** | 2026-06-09 21:22:19 |
+| **DAG Versions** | v1, v2, v3 |
+
+</div>
+
+### Complete Task Execution Flow
+
+All pipeline tasks executed successfully with proper branching logic:
+
+<div align="center">
+
+![Pipeline Task Execution Tree](https://i.imgur.com/pipeline-task-tree.png)
+
+</div>
+
+**Execution Steps (All Passed ✅):**
+
+1. ✅ **load_data** — Load training data from sources
+2. ✅ **validate_production_data** — Validate schema and quality  
+3. ✅ **process_both_datasets** — Feature engineering and preprocessing
+4. ✅ **detect_drift** — Statistical drift detection
+5. ✅ **make_retrain_decision** — Multi-factor decision algorithm
+6. ✅ **branch_on_decision** — Branch execution based on decision
+7. 🔄 **no_retrain_needed** — Skip to monitoring if no drift
+8. ✅ **train_model** — Train challenger model with CV/HPO
+9. ✅ **champion_challenger_evaluation** — Statistically compare models
+10. ✅ **check_approval_required** — Evaluate improvement metrics
+11. ✅ **approval_branch** — Route based on approval status
+12. 🔄 **challenger_rejected** — Keep current champion if not better
+13. ✅ **register_model_staging** — Register in model registry
+14. ✅ **deploy_model** — Canary deployment orchestration
+15. ✅ **promote_to_champion** — Promote to production if healthy
+16. ✅ **shift_reference** — Update baseline for next cycle
+17. ✅ **pipeline_report** — Generate execution report
+
+---
+
+## Monitoring & Observability
+
+### Real-Time Prometheus Metrics
+
+The system continuously exports detailed metrics for performance monitoring and alerting:
+
+<div align="center">
+
+![Prometheus Metrics Dashboard](https://i.imgur.com/prometheus-metrics-dashboard.png)
+
+</div>
+
+**Metrics Being Tracked:**
+- 🟢 **BentoML Service Requests** (Green Line) — Successful prediction requests (HTTP 200)
+- 🟡 **Health Check Endpoints** (Yellow Area) — /health endpoint responses
+- 🟣 **Deployment Routes** (Purple/Magenta) — /predict and other API endpoints
+- 🔴 **Error Responses** — HTTP 400, 405, 500 error tracking
+
+**Timeline Analysis:**
+- Steady baseline traffic at ~150 requests
+- Gradual traffic increase from 23:10 to 02:00 (ramping up to ~400+ requests)
+- Consistent performance across all endpoints
+- No errors or dropouts observed
+- Service health maintained throughout execution window
+
+### Key Metrics Exported
+
+```bash
+# Latency (p99)
+histogram_quantile(0.99, rate(model_serving_latency_ms[5m]))
+
+# Throughput
+rate(predictions_total[1m])
+
+# Retraining duration
+retraining_duration_seconds
+
+# Drift PSI
+drift_psi_score
+
+# Model serving errors
+rate(model_serving_errors_total[5m])
+
+# Bentoml request success rate
+rate(bentoml_service_request_duration_seconds_count{http_status="200"}[5m])
+```
+
+### Grafana Dashboards
+
+Pre-built dashboards:
+1. ML Lifecycle Overview
+2. Model Performance  
+3. Data Quality
+4. Drift Detection
+5. System Health
+6. Deployment Progress
+
+Access at `http://localhost:3000`
+
+---
+
 ## Quick Start Guide
 
 ### Prerequisites
@@ -495,6 +613,7 @@ make docker-up
 # - MLflow: http://localhost:5000
 # - Prometheus: http://localhost:9090
 # - Grafana: http://localhost:3000
+# - Airflow: http://localhost:8080
 ```
 
 ### Verify Installation
@@ -554,37 +673,6 @@ GET /pipeline/history          # Past runs
 # Real-time
 GET /events                    # SSE stream of events
 ```
-
----
-
-## Monitoring & Observability
-
-### Prometheus Metrics
-
-```bash
-# Latency (p99)
-histogram_quantile(0.99, rate(model_serving_latency_ms[5m]))
-
-# Throughput
-rate(predictions_total[1m])
-
-# Retraining duration
-retraining_duration_seconds
-
-# Drift PSI
-drift_psi_score
-```
-
-### Grafana Dashboards
-
-Pre-built dashboards:
-1. ML Lifecycle Overview
-2. Model Performance
-3. Data Quality
-4. Drift Detection
-5. System Health
-
-Access at `http://localhost:3000`
 
 ---
 
@@ -673,11 +761,12 @@ MIT License — see [LICENSE](LICENSE)
 Built with:
 - [FastAPI](https://fastapi.tiangolo.com/) — Web framework
 - [MLflow](https://mlflow.org/) — Experiment tracking
+- [Apache Airflow](https://airflow.apache.org/) — Workflow orchestration
 - [Evidently AI](https://www.evidentlyai.com/) — Drift detection
 - [Great Expectations](https://greatexpectations.io/) — Data validation
 - [Optuna](https://optuna.org/) — Hyperparameter optimization
 - [BentoML](https://www.bentoml.com/) — Model serving
-- [Prometheus](https://prometheus.io/) — Metrics
+- [Prometheus](https://prometheus.io/) — Metrics collection
 - [Grafana](https://grafana.com/) — Visualization
 
 ---
