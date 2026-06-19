@@ -211,7 +211,36 @@ ml-lifecycle-system/
 ├── 📄 Dockerfile                   # Container definition
 ├── 📄 docker-compose.yml           # Multi-container orchestration
 ├── 📄 .env.example                 # Environment template
-│
+|
+├── 📁 docker/
+│   ├── airflow
+|   │   ├── Dockerfile
+│   |   └── requirements.txt    # Create synthetic data
+│   ├── base
+|   │   ├── Dockerfile
+│   |   └── requirements.txt
+│   |──bentoml
+|   |   ├── Dockerfile
+│   |── fastapi
+|   │   ├── Dockerfile
+│   └── mlflow
+|
+├── 📁 monitoring/
+|   |── grafana
+|   |   └── provisioning
+|   |       └── dashboards
+|   |           |── dashboards.yml
+|   |           └── prometheus.yml 
+|   |──otel
+|   |   └── otel-collector-config.yml
+|   |── prometheus/
+│   |   ├── prometheus.yml         # Deployment health checks
+│   |   └── alert_rules.yml               # Alert triggers
+|   |── data_quality_monitor.py 
+│   ├── drift_monitor.py              # Prometheus metrics registry
+│   ├── performance_monitor.py  # Model performance tracking
+│   ├── monitoring_pipeline.py         # Deployment health checks
+│   └── alerting.py               # Alert triggers
 ├── 📁 config/
 │   ├── settings.py                 # Global configuration loader
 │   ├── logging_config.py           # Logging setup
@@ -223,20 +252,28 @@ ml-lifecycle-system/
 ├── 📁 src/
 │   │
 │   ├── 📁 data/
-│   │   ├── ingestion.py            # Load data from sources
-│   │   ├── validation.py           # Schema & quality validation
-│   │   ├── preprocessing.py        # Feature engineering, scaling
-│   │   └── versioning.py           # Data versioning & tracking
-│   │
+│   │   ├── column_config.py            # Load data from sources
+│   │   ├── loader.py           # Schema & quality validation
+│   │   ├── pipeline_builder.py        # Feature engineering, scaling
+│   │   |── processing.py           # Data versioning & tracking
+|   |   ├── processing_config.py            # Load data from sources
+│   │   ├── processing_report.py           # Schema & quality validation
+│   │   ├── transformers.py        # Feature engineering, scaling
+│   │   └── validation.py           # Data versioning & tracking
+|   |
 │   ├── 📁 drift/
 │   │   ├── detector.py             # Statistical drift detection
 │   │   ├── report_builder.py       # Generate drift reports
-│   │   └── alerting.py             # Drift-based alerts
+│   │   └── statistical_tests.py             # Drift-based alerts
 │   │
 │   ├── 📁 decision/
 │   │   ├── retrain_policy.py       # Retraining decision logic
 │   │   └── exceptions.py           # Decision-specific errors
-│   │
+|   |
+│   ├── 📁 deployment/
+│   │   ├── deployer.py       # Retraining decision logic
+│   │   └── traffic_manager.py           # Decision-specific errors
+|   |
 │   ├── 📁 training/
 │   │   ├── trainer.py              # Model training orchestration
 │   │   ├── hyperparameter_tuner.py # HPO with Optuna/GridSearch
@@ -253,67 +290,51 @@ ml-lifecycle-system/
 │   │   └── model_state.py          # State transitions
 │   │
 │   ├── 📁 serving/
-│   │   ├── model_server.py         # FastAPI prediction server
-│   │   ├── service.py              # BentoML service definition
-│   │   ├── runners.py              # Async runners & scaling
-│   │   └── bentofile.yaml          # BentoML configuration
-│   │
-│   ├── 📁 monitoring/
-│   │   ├── metrics.py              # Prometheus metrics registry
-│   │   ├── performance_monitor.py  # Model performance tracking
-│   │   ├── health_check.py         # Deployment health checks
-│   │   └── alerts.py               # Alert triggers
+│   │   ├── bentoml_service.py         # FastAPI prediction server
+│   │   ├── predictor.py              # BentoML service definition
 │   │
 │   ├── 📁 orchestration/
-│   │   ├── pipeline_orchestrator.py # Main pipeline coordinator
+│   │   ├── pipeline.py # Main pipeline coordinator
 │   │   ├── dags/
 │   │   │   ├── ml_lifecycle_dag.py  # Airflow DAG definition
 │   │   │   └── dag_utils.py         # DAG utilities
-│   │   └── task_runner.py           # Task execution framework
 │   │
 │   ├── 📁 observability/
 │   │   ├── event_bus.py            # Central event emitter
-│   │   ├── step_tracker.py         # Per-step execution tracking
-│   │   ├── pipeline_state.py       # Global pipeline state machine
-│   │   └── formatters.py           # Event formatting for UI/SSE
+│   │   ├── prometheus_handler.py         # Per-step execution tracking
+│   │   ├── metrics.py       # Global pipeline state machine
 │   │
 │   ├── 📁 api/
+|   |   └── dependencies.py
 │   │   ├── app.py                  # FastAPI application
 │   │   ├── routes/
 │   │   │   ├── predictions.py      # GET /predict, POST /batch-predict
 │   │   │   ├── models.py           # GET /models, POST /promote
 │   │   │   ├── pipelines.py        # GET /pipeline/status
 │   │   │   ├── drift.py            # GET /drift/report
-│   │   │   ├── observability.py    # SSE /events
 │   │   │   └── health.py           # GET /health, GET /readiness
 │   │   ├── middleware/
 │   │   │   ├── auth.py             # Authentication middleware
-│   │   │   ├── logging.py          # Request/response logging
-│   │   │   └── error_handlers.py   # Global error handling
+│   │   │   ├── auto_logger.py          # Request/response logging
+│   │   │   |── circuit_breaker.py   # Global error handling
+|   |   |   └── rate_limiter.py
 │   │   └── schemas/
 │   │       ├── prediction.py       # Request/response schemas
-│   │       ├── pipeline_events.py  # Event schemas
-│   │       └── models.py           # Model metadata schemas
+│   │       └── common.py           # Model metadata schemas
 │   │
 │   ├── 📁 common/
 │   │   ├── exceptions.py           # Custom exception hierarchy
-│   │   ├── enums.py                # Enums (ModelStatus, DecisionLevel)
-│   │   ├── utils.py                # Utility functions
-│   │   └── decorators.py           # Retry, cache, timing decorators
+│   │   └── enums.py                # Enums (ModelStatus, DecisionLevel)
 │   │
 │   └── __init__.py
 │
 ├── 📁 tests/
-│   ├── conftest.py                 # Pytest fixtures & configuration
 │   ├── 📁 unit/
 │   │   ├── test_data_validation.py
 │   │   ├── test_drift_detection.py
 │   │   ├── test_decision_engine.py
 │   │   ├── test_trainer.py
 │   │   └── test_serving.py
-│   └── 📁 integration/
-│       ├── test_full_pipeline.py
-│       └── test_deployment_flow.py
 │
 ├── 📁 scripts/
 │   ├── run_full_lifecycle.py       # CLI: Execute full pipeline
@@ -534,8 +555,6 @@ GET /pipeline/history          # Past runs
 GET /events                    # SSE stream of events
 ```
 
-See [API.md](docs/API.md) for full reference.
-
 ---
 
 ## Monitoring & Observability
@@ -622,8 +641,6 @@ New model runs in parallel; predictions logged but not served.
 | **Slow predictions** | Model too large or under-provisioned | Increase API workers, optimize model size |
 | **Champion never promotes** | Strict comparison thresholds | Review evaluation criteria, ensure test set is representative |
 
-See [Troubleshooting Guide](docs/TROUBLESHOOTING.md) for detailed diagnostics.
-
 ---
 
 ## Contributing
@@ -669,9 +686,8 @@ Built with:
 
 - **Issues:** GitHub Issues
 - **Discussions:** GitHub Discussions
-- **Email:** support@example.com
 
 ---
 
 **Made with ❤️ for production ML teams**  
-Last updated: January 2025
+Last updated: June 2026
