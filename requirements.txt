@@ -22,3 +22,6 @@ apache-airflow==3.2.1
 pydantic-settings==2.14.1
 kubernetes==36.0.0
 evidently==0.7.21
+graphifyy==0.8.22
+starlette==1.2.1
+prometheus-fastapi-instrumentator==8.0.0
