@@ -220,7 +220,7 @@ ml-lifecycle-system/
 │   ├── base
 |   │   ├── Dockerfile
 │   |   └── requirements.txt
-│   |──bentoml
+│   |── bentoml
 |   |   ├── Dockerfile
 │   |── fastapi
 |   │   ├── Dockerfile
@@ -232,7 +232,7 @@ ml-lifecycle-system/
 |   |       └── dashboards
 |   |           |── dashboards.yml
 |   |           └── prometheus.yml 
-|   |──otel
+|   |── otel
 |   |   └── otel-collector-config.yml
 |   |── prometheus/
 │   |   ├── prometheus.yml         # Deployment health checks
@@ -463,7 +463,7 @@ The complete ML lifecycle is orchestrated through Apache Airflow DAGs that manag
 
 <div align="center">
 
-![Airflow DAG Run Status](https://i.imgur.com/scheduled_2026-06-09T00_00_00.png)
+![Airflow DAG Run Status](/assets/airflow-dag-run.png)
 
 | Metric | Value |
 |--------|-------|
@@ -483,7 +483,7 @@ All pipeline tasks executed successfully with proper branching logic:
 
 <div align="center">
 
-![Pipeline Task Execution Tree](https://i.imgur.com/pipeline-task-tree.png)
+![Pipeline Task Execution Tree](/assets/pipeline-task-execution-tree.png)
 
 </div>
 
@@ -517,7 +517,7 @@ The system continuously exports detailed metrics for performance monitoring and 
 
 <div align="center">
 
-![Prometheus Metrics Dashboard](https://i.imgur.com/prometheus-metrics-dashboard.png)
+![Prometheus Metrics Dashboard](/assets/prometheus-metrics-dashboard.png)
 
 </div>
 
