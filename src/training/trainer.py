@@ -302,7 +302,7 @@ class ModelTrainer:
                     json.dump(feature_importance, f, indent=2)
 
                 # Save local artifact
-                self._save_model_artifact(model, model_id, model_version)
+                model_path = self._save_model_artifact(model, model_id, model_version)
 
                 preprocessing_path = self._save_preprocessing_artifact(
                     model_id, model_version
