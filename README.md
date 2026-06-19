@@ -193,7 +193,7 @@ The system is built on three core principles:
 | **Evaluation** | Champion/challenger comparison, statistical testing | `src/evaluation/` |
 | **Model Registry** | Artifact storage, versioning, promotion | `src/registry/` |
 | **Serving** | Real-time and batch prediction APIs | `src/serving/` |
-| **Monitoring** | Metrics collection, alerting, performance tracking | `src/monitoring/` |
+| **Monitoring** | Metrics collection, alerting, performance tracking | `monitoring/` |
 | **Orchestration** | Pipeline coordination and scheduling | `src/orchestration/` |
 | **Observability** | Event bus, real-time state tracking, audit logs | `src/observability/` |
 | **API** | FastAPI endpoints for predictions, monitoring, pipelines | `src/api/` |
