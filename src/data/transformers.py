@@ -55,12 +55,10 @@ class StructuralCleaner(BaseEstimator, TransformerMixin):
     def __init__(
         self,
         max_null_rate: float = 0.70,
-        min_variance: float = 1e-8,
-        duplicate_subset: Optional[list[str]] = None,
+        min_variance: float = 1e-8
     ) -> None:
         self.max_null_rate    = max_null_rate
         self.min_variance     = min_variance
-        self.duplicate_subset = duplicate_subset
 
     def fit(self, X: pd.DataFrame, y: Any = None) -> "StructuralCleaner":
         """
@@ -101,49 +99,28 @@ class StructuralCleaner(BaseEstimator, TransformerMixin):
         )
         return self
 
-    def transform(self, X: pd.DataFrame, y: Any = None) -> pd.DataFrame:
-        """
-        Apply fitted drop list + remove duplicates.
-        Never recomputes which columns to drop.
-        """
+    def transform(self, X):
+        """Drop only columns identified during fit. NO row operations."""
         check_is_fitted(self, ["cols_to_drop_", "input_features_"])
         self._validate_dataframe(X)
-
         X = X.copy()
-
-        # Drop duplicate rows
-        n_before = len(X)
-        X        = X.drop_duplicates(
-            subset=self.duplicate_subset, keep="first"
-        ).reset_index(drop=True)
-        n_dupes  = n_before - len(X)
-        if n_dupes > 0:
-            logger.info(f"StructuralCleaner: removed {n_dupes} duplicate rows")
 
         # Drop columns identified at fit time
         existing_drop = [c for c in self.cols_to_drop_ if c in X.columns]
         if existing_drop:
             X = X.drop(columns=existing_drop)
 
-        # Schema drift: drop unknown columns in transform
+        # Schema drift handling
         known_cols = set(self.input_features_) - set(self.cols_to_drop_)
-        unknown    = set(X.columns) - known_cols
+        unknown = set(X.columns) - known_cols
         if unknown:
-            logger.warning(
-                f"StructuralCleaner: schema drift — "
-                f"dropping unknown columns: {sorted(unknown)}"
-            )
             X = X.drop(columns=list(unknown))
 
-        # Add missing expected columns as NaN
         for col in known_cols:
             if col not in X.columns:
                 X[col] = np.nan
-                logger.warning(
-                    f"StructuralCleaner: missing column '{col}' → NaN"
-                )
 
-        return X
+        return X  # No y handling needed, no row drops
 
     @staticmethod
     def _validate_dataframe(X: Any) -> None:
@@ -192,7 +169,7 @@ class TypeFixer(BaseEstimator, TransformerMixin):
     ) -> None:
         self.column_configs = column_configs or {}
 
-    def fit(self, X: pd.DataFrame, y: Any = None) -> "TypeFixer":
+    def fit(self, X: pd.DataFrame, y: Any) -> "TypeFixer":
         """
         Stateless — just validate and store column list.
         fit() returns self to satisfy sklearn contract.
@@ -200,6 +177,7 @@ class TypeFixer(BaseEstimator, TransformerMixin):
         if not isinstance(X, pd.DataFrame):
             raise TypeError(f"TypeFixer requires pd.DataFrame, got {type(X)}")
         self.feature_names_in_ = list(X.columns)
+        logger.info(f"TypeFixer fitted: {len(self.feature_names_in_)} columns")
         return self
 
     def transform(self, X: pd.DataFrame, y: Any = None) -> pd.DataFrame:
@@ -281,6 +259,10 @@ class TypeFixer(BaseEstimator, TransformerMixin):
                 if cfg.max_value is not None:
                     bad = X[col] > cfg.max_value
                     if bad.any():
+                        logger.debug(
+                            f"TypeFixer '{col}': "
+                            f"{int(bad.sum())} values > {cfg.max_value} → NaN"
+                        )
                         X.loc[bad, col] = np.nan
 
             # ── Allowed values ─────────────────────────────────────────────
@@ -292,8 +274,12 @@ class TypeFixer(BaseEstimator, TransformerMixin):
                 allowed  = {str(v) for v in cfg.allowed_values}
                 bad_mask = ~X[col].astype(str).isin(allowed) & X[col].notna()
                 if bad_mask.any():
+                    logger.debug(
+                        f"TypeFixer '{col}': "
+                        f"{int(bad_mask.sum())} values not in allowed set → NaN"
+                    )
                     X.loc[bad_mask, col] = np.nan
-
+        logger.info(f"TypeFixer: transformed DataFrame with shape {X.shape} and {y.shape if y is not None else 'no target'}")
         return X
 
 
@@ -455,7 +441,7 @@ class OutlierHandler(BaseEstimator, TransformerMixin):
                 values[not_null] = np.log1p(values[not_null] + shift)
 
             X[col] = values
-
+        logger.info(f"OutlierHandler: transformed DataFrame with shape {X.shape}")
         return X
 
     def get_feature_names_out(
@@ -569,7 +555,7 @@ class FrequencyEncoder(BaseEstimator, TransformerMixin):
                 .fillna(fallback)
                 .astype(np.float32)
             )
-
+        logger.info(f"FrequencyEncoder: transformed DataFrame with shape {X.shape}")
         return X
 
     def get_feature_names_out(
@@ -692,7 +678,7 @@ class LeakageGuard(BaseEstimator, TransformerMixin):
                 f"LeakageGuard: dropping non-numeric stragglers: {obj_cols}"
             )
             X = X.drop(columns=obj_cols)
-
+        logger.info(f"LeakageGuard: transformed DataFrame with shape {X.shape}")
         return X
 
     def get_feature_names_out(
