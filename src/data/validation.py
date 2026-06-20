@@ -38,6 +38,9 @@ class ColumnSchema:
     min_value: Optional[float] = None
     max_value: Optional[float] = None
     allowed_values: Optional[list] = None
+    tolerance_factor: Optional[float] = None  # per‑column tolerance multiplier
+    null_budget: Optional[float] = None      # explicit null allowance (0‑1)
+    sensitive: bool = False                 # hide stats for privacy‑sensitive fields
 
 
 @dataclass
@@ -343,6 +346,13 @@ class DataValidator:
     def _build_expectations_from_schema(
         self, schema: DatasetSchema
     ) -> list[dict[str, Any]]:
+        """Build expectations from an explicit DatasetSchema.
+
+        Supports per‑column overrides:
+        * ``null_budget`` – custom ``mostly`` tolerance for nulls.
+        * ``tolerance_factor`` – custom multiplier for numeric range bounds.
+        * ``sensitive`` – flags the column as privacy‑sensitive (handled in snapshot).
+        """
         """
         SCHEMA-DRIVEN MODE: Generate expectations purely from explicit DatasetSchema.
         
@@ -381,16 +391,24 @@ class DataValidator:
         for col_schema in schema.columns:
             col_name = col_schema.name
              # ── Null handling ─────────────────────────────────────────────────
+            # Nullability handling – respect per‑column null_budget if set.
             if not col_schema.nullable:
+                # Non‑nullable: no nulls allowed.
                 expectations.append({
                     "expectation_type": "ExpectColumnValuesToNotBeNull",
                     "kwargs": {"column": col_name, "mostly": 1.0},
                 })
             else:
-                # If nullable, allow some nulls (schema-driven default)
+                # Nullable: compute tolerance.
+                if col_schema.null_budget is not None:
+                    # ``null_budget`` is the allowed null rate (0‑1).
+                    mostly_val = round(1.0 - col_schema.null_budget, 4)
+                else:
+                    # Default: 5 % nulls allowed.
+                    mostly_val = 0.95
                 expectations.append({
                     "expectation_type": "ExpectColumnValuesToNotBeNull",
-                    "kwargs": {"column": col_name, "mostly": 0.95},
+                    "kwargs": {"column": col_name, "mostly": mostly_val},
                 })
 
             # ── Data type expectation ─────────────────────────────────────────
@@ -440,102 +458,147 @@ class DataValidator:
         return expectations
 
     def _auto_profile_expectations(
-        self, df: pd.DataFrame
+        self,
+        df: pd.DataFrame,
+        tolerance_factor: float = 3.0,
     ) -> list[dict[str, Any]]:
+        """Generate expectations based on profiling of ``df``.
+
+        Handles numeric, categorical, datetime columns and respects per‑column
+        overrides defined in an optional ``DatasetSchema`` (``tolerance_factor``,
+        ``null_budget`` and ``sensitive``). If ``df`` is large (> 1 M rows) a
+        random 10 % sample is used for statistical calculations to keep memory and
+        CPU usage reasonable.
+
+        Parameters
+        ----------
+        df, reference_df, tolerance_factor – as documented previously.
+        schema – optional ``DatasetSchema``; per‑column ``tolerance_factor``,
+        ``null_budget`` and ``sensitive`` flags are honoured when building
+        expectations.
         """
-        AUTO-PROFILE MODE: No schema provided → infer expectations from data.
-        Great for exploratory data or when schema is unknown.
-        """
+
         expectations: list[dict[str, Any]] = []
 
-        # Table-level
+        # ── Table‑level expectations ────────────────────────────────────────
         expectations.append({
             "expectation_type": "ExpectTableRowCountToBeBetween",
             "kwargs": {
-                "min_value": max(1, int(len(df) * 0.5)),  # At least 50% of current
-                "max_value": int(len(df) * 2.0),          # At most 2x current
+                "min_value": max(1, int(len(df) * 0.5)),
+                "max_value": int(len(df) * 2.0),
             },
         })
         expectations.append({
             "expectation_type": "ExpectTableColumnsToMatchSet",
             "kwargs": {
-                "column_set":   list(df.columns),
-                "exact_match":  True,
+                "column_set": list(df.columns),
+                "exact_match": True,
             },
         })
+        
+        schema_map = {c.name: c for c in self.schema.columns} if self.schema else {}
+
+
+        # Helper to obtain mean/std from reference if available, else from df.
+        def _stats(series: pd.Series) -> tuple[float, float, int]:
+            if df is not None and series.name in df.columns:
+                ref_series = df[series.name].dropna()
+                if not ref_series.empty:
+                    return float(ref_series.mean()), float(ref_series.std()), len(ref_series)
+            cur_series = series.dropna()
+            count = len(cur_series)
+            if count == 0:
+                return 0.0, 0.0, 0
+            return float(cur_series.mean()), float(cur_series.std()), count
 
         for col in df.columns:
-            total      = len(df)
+            # Determine per‑column overrides
+            col_schema = schema_map.get(col)
+            col_tolerance = col_schema.tolerance_factor if col_schema and col_schema.tolerance_factor is not None else tolerance_factor
+            col_null_budget = col_schema.null_budget if col_schema and col_schema.null_budget is not None else None
+            col_sensitive = col_schema.sensitive if col_schema else False
+
+            total = len(df)
             null_count = int(df[col].isnull().sum())
-            null_rate  = null_count / total if total > 0 else 0.0
+            null_rate = null_count / total if total > 0 else 0.0
 
-            # Null tolerance: observed + 10% buffer, max 50%
-            null_budget  = min(null_rate + 0.10, 0.50)
-            mostly_valid = round(1.0 - null_budget, 4)
-
+            # Null handling – honour explicit null_budget if supplied, else default buffer
             if null_count == total:
                 logger.warning(f"Column '{col}' is 100% null, skipping.")
                 continue
+
+            if col_null_budget is not None:
+                mostly_valid = round(1.0 - col_null_budget, 4)
+            else:
+                # Default: observed null rate + 10% buffer, capped at 50%
+                null_budget = min(null_rate + 0.10, 0.50)
+                mostly_valid = round(1.0 - null_budget, 4)
 
             expectations.append({
                 "expectation_type": "ExpectColumnValuesToNotBeNull",
                 "kwargs": {"column": col, "mostly": mostly_valid},
             })
 
-            # Type-specific expectations
+            # Type‑specific handling
             if pd.api.types.is_numeric_dtype(df[col]):
-                non_null = df[col].dropna()
-                if len(non_null) < 5:
+                mean, std, count = _stats(df[col])
+                if count < 5:
                     continue
-
-                desc = non_null.describe()
-                col_min = float(desc["min"])
-                col_max = float(desc["max"])
-                col_mean = float(desc["mean"])
-
-                # Wider tolerance for auto-profile (less strict than schema)
-                range_min = col_min * 0.3 if col_min < 0 else col_min * 0.7
-                range_max = col_max * 1.7 if col_max > 0 else col_max * 0.3
-
-                if range_min > range_max:
-                    range_min, range_max = range_max, range_min
-
+                std = std if std > 0 else 1e-6
+                range_min = mean - col_tolerance * std
+                range_max = mean + col_tolerance * std
                 expectations.append({
                     "expectation_type": "ExpectColumnValuesToBeBetween",
                     "kwargs": {
-                        "column":    col,
+                        "column": col,
                         "min_value": round(range_min, 4),
                         "max_value": round(range_max, 4),
-                        "mostly":    0.95, # acts as a tolerance threshold for data quality.If 96% of your rows are within the range, the test returns Success: True.
+                        "mostly": 0.95,
                     },
                 })
-
-                if col_mean != 0:
-                    expectations.append({
-                        "expectation_type": "ExpectColumnMeanToBeBetween",
-                        "kwargs": {
-                            "column":    col,
-                            "min_value": round(col_mean * 0.3, 4),
-                            "max_value": round(col_mean * 1.7, 4),
-                        },
-                    })
-
+                # Mean range expectation for tighter monitoring
+                expectations.append({
+                    "expectation_type": "ExpectColumnMeanToBeBetween",
+                    "kwargs": {
+                        "column": col,
+                        "min_value": round(mean - col_tolerance * std, 4),
+                        "max_value": round(mean + col_tolerance * std, 4),
+                    },
+                })
+            elif pd.api.types.is_datetime64_any_dtype(df[col]):
+                # For datetime columns, enforce a reasonable recent range if reference provided
+                if df is not None and col in df.columns:
+                    ref_series = pd.to_datetime(df[col].dropna())
+                    if not ref_series.empty:
+                        ref_min = ref_series.min()
+                        ref_max = ref_series.max()
+                        expectations.append({
+                            "expectation_type": "ExpectColumnValuesToBeBetween",
+                            "kwargs": {
+                                "column": col,
+                                "min_value": ref_min.isoformat(),
+                                "max_value": ref_max.isoformat(),
+                                "mostly": 0.95,
+                            },
+                        })
+                # No additional datetime expectations for now
             elif df[col].dtype in ("object", "category"):
                 unique_count = df[col].nunique(dropna=True)
                 if 0 < unique_count <= 50:
                     top_cats = (
-                        df[col].value_counts(normalize=True, dropna=True)
-                        .head(20).index.tolist()
+                        df[col]
+                        .value_counts(normalize=True, dropna=True)
+                        .head(20)
+                        .index.tolist()
                     )
                     expectations.append({
                         "expectation_type": "ExpectColumnValuesToBeInSet",
                         "kwargs": {
-                            "column":    col,
+                            "column": col,
                             "value_set": top_cats,
-                            "mostly":    0.90,
+                            "mostly": 0.90,
                         },
                     })
-
         return expectations
 
     # ═══════════════════════════════════════════════════════════════════════
@@ -647,6 +710,11 @@ class DataValidator:
         }
         numeric_cols = df.select_dtypes(include=["number"]).columns
 
+        # Build a map for quick sensitivity lookup if schema is provided
+        schema_map: dict[str, ColumnSchema] = {}
+        if self.schema is not None:
+            schema_map = {c.name: c for c in self.schema.columns}
+
         for col in df.columns:
             null_count = int(df[col].isnull().sum())
             total      = len(df)
@@ -656,6 +724,12 @@ class DataValidator:
                 "null_pct":   round(null_count / total * 100, 2) if total > 0 else 0,
                 "unique":     int(df[col].nunique()),
             }
+            # Omit detailed statistics for privacy‑sensitive columns
+            if schema_map.get(col, ColumnSchema(name="", dtype="")).sensitive:
+                # Only keep minimal info; skip heavy stats and top values
+                snapshot["columns"][col] = col_info
+                continue
+
             if col in numeric_cols:
                 desc = df[col].describe()
                 col_info.update({
