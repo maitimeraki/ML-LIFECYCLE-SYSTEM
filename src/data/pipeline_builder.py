@@ -215,14 +215,13 @@ class ProcessingPipelineBuilder:
                 "structural",
                 StructuralCleaner(
                     max_null_rate=self.config.max_null_rate_to_drop_column,
-                    min_variance=self.config.min_variance_threshold,
-                    duplicate_subset=self.config.duplicate_subset,
-                ),
+                    min_variance=self.config.min_variance_threshold
+                ), # Return Dataframe will have columns after dropping bad columns/rows
             ),
             (
                 "type_fix",
                 TypeFixer(column_configs=self.config.columns),
-            ),
+            ), # Return DataFrame with fixed dtypes, ready for ColumnTransformer and DataFrame comes from previous step
             (
                 "outlier",
                 OutlierHandler(
@@ -291,6 +290,7 @@ class ProcessingPipelineBuilder:
             ),
             ("scaler", scaler),
         ]
+        logger.info("Build numeric pipeline with Simpleimputation strategy")
 
         return Pipeline(steps=steps)
 
@@ -305,6 +305,7 @@ class ProcessingPipelineBuilder:
         KNNImputer.transform() finds neighbors in TRAINING space.
         Zero leakage at transform time.
         """
+        logger.info("Build KNN imputation pipeline with KNNImputer strategy")
         return Pipeline(steps=[
             (
                 "knn_imputer",
@@ -337,6 +338,7 @@ class ProcessingPipelineBuilder:
                 all_categories.append(cfg.ordinal_categories)
             else:
                 all_categories.append("auto")
+        logger.info("Build ordinal encoding pipeline")
 
         return Pipeline(steps=[
             (
