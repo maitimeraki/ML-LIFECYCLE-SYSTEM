@@ -189,6 +189,17 @@ class ProductionDataProcessor:
             f"reference={len(reference_df)} rows, "
             f"production={len(production_df)} rows"
         )
+        # ── NEW: Deduplicate BEFORE pipeline ─────────────────────────────
+        ref_features, ref_target = self._separate_target(reference_df)
+        prod_features, prod_target = self._separate_target(production_df)
+        
+        # ── Step 2: Deduplicate BEFORE pipeline ──────────────────────────
+        ref_features, ref_target = self._deduplicate_together(
+            ref_features, ref_target
+        )
+        prod_features, prod_target = self._deduplicate_together(
+            prod_features, prod_target
+        )
 
         # ── Step 1: Auto-build config from reference data ──────────────────
         # Why reference? Config should reflect what model was trained on.
@@ -200,12 +211,11 @@ class ProductionDataProcessor:
             onehot_threshold=self.onehot_threshold,
             skewness_threshold=self.skewness_threshold,
         )
-        self._config = auto_builder.build(reference_df) # Return ProcessingConfig with column strategies based on reference data analysis
+        self._config = auto_builder.build(ref_features) # Return ProcessingConfig with column strategies based on reference data analysis
 
         # ── Step 2: Build sklearn Pipeline from auto-config ────────────────
         builder        = ProcessingPipelineBuilder(self._config)
-        ref_features, ref_target = self._separate_target(reference_df)
-        self._pipeline = builder.build(ref_features)
+        self._pipeline = builder.build(ref_features)  # Return sklearn Pipeline with transformers based on config
 
         # ── Step 3: Fit on reference data ──────────────────────────────────
         y_ref = ref_target.values if ref_target is not None else None
@@ -214,23 +224,28 @@ class ProductionDataProcessor:
         self._is_fitted = True
         self._feature_names_out = self._get_feature_names()
 
-        logger.info(
-            f"Pipeline fitted on reference data."
+        logger.debug(
+            f"Pipeline fitted on reference data. "
             f"Features out: {len(self._feature_names_out)}"
         )
+        ref_clean = ref_features.copy()
+        ref_clean[self.target_column] = ref_target
+        
+        prod_clean = prod_features.copy()
+        prod_clean[self.target_column] = prod_target
 
         # ── Step 4: Transform reference ────────────────────────────────────
-        ref_report    = self._make_report(reference_df, "reference")
+        ref_report    = self._make_report(ref_clean, "reference")
         ref_processed = self._apply_transform(
-            reference_df, ref_report, dataset_label="reference"
+            ref_clean, ref_report, dataset_label="reference"
         )
 
         # ── Step 5: Transform production ───────────────────────────────────
         # Uses EXACTLY same fitted parameters as reference transform
         # No production statistics contaminate the processor
-        prod_report    = self._make_report(production_df, "production")
+        prod_report    = self._make_report(prod_clean, "production")
         prod_processed = self._apply_transform(
-            production_df, prod_report, dataset_label="production"
+            prod_clean, prod_report, dataset_label="production"
         )
 
         # ── Step 6: Save fitted processor ──────────────────────────────────
@@ -321,22 +336,27 @@ class ProductionDataProcessor:
             if self._pipeline is None:
                 raise RuntimeError("Pipeline not built.")
             transformed_array = self._pipeline.transform(df_features)
+            logger.info(f"Pipeline transform successful on {dataset_label}. Output shape: {transformed_array.shape}")
         except Exception as exc:
             logger.error(
                 f"Pipeline transform failed on {dataset_label}: {exc}",
                 exc_info=True,
             )
             raise
+    
 
-        result_df = self._array_to_dataframe(
-            transformed_array, df_features.index
-        )
+        # Convert transformed array back to DataFrame. Use default index matching array length.
+        result_df = self._array_to_dataframe(transformed_array)
 
-        # Reattach target (untouched)
+        # Reattach target (aligned if provided)
         if target_series is not None:
-            result_df[self.target_column] = (
-                target_series.reindex(result_df.index).values
-            )
+            # Assign only if lengths match to avoid ValueError when rows were dropped (e.g., duplicate removal).
+            if len(target_series) == len(result_df):
+                result_df[self.target_column] = target_series.values
+            else:
+                logger.warning(
+                    f"Target series length {len(target_series)} does not match transformed rows {len(result_df)}; skipping target assignment."
+                )
 
         result_df = self._final_cleanup(result_df)
 
@@ -358,7 +378,35 @@ class ProductionDataProcessor:
     # ─────────────────────────────────────────────────────────────────────
     # Helpers
     # ─────────────────────────────────────────────────────────────────────
-
+    def _deduplicate_together(
+    self,
+    X: pd.DataFrame,
+    y: pd.Series,
+    subset: Optional[list[str]] = None,
+    ) -> tuple[pd.DataFrame, pd.Series]:
+        """
+        Drop duplicate rows from X and align y to same indices.
+        Called BEFORE pipeline to ensure X and y stay in sync.
+        """
+        n_before = len(X)
+        
+        # Drop duplicates from X
+        X_deduped = X.drop_duplicates(subset=subset, keep="first")
+        n_dupes = n_before - len(X_deduped)
+        
+        if n_dupes > 0:
+            kept_indices = X_deduped.index
+            y = y.loc[kept_indices].reset_index(drop=True)
+            X = X_deduped.reset_index(drop=True)
+            logger.info(
+                f"Pre-pipeline dedup: removed {n_dupes} rows. "
+                f"X: {n_before}→{len(X)}, y: {len(y)}"
+            )
+        else:
+            X = X.reset_index(drop=True)
+            y = y.reset_index(drop=True)
+        
+        return X, y
     def _separate_target(
         self, df: pd.DataFrame
     ) -> tuple[pd.DataFrame, pd.Series]:
@@ -388,15 +436,29 @@ class ProductionDataProcessor:
     def _array_to_dataframe(
         self,
         array: np.ndarray,
-        index: pd.Index,
+        index: Optional[pd.Index] = None,
     ) -> pd.DataFrame:
+        """Convert a numpy array to a DataFrame.
++
++        * If an ``index`` is provided (as is the case when the transformer
++          does not drop rows), it is truncated to the length of ``array`` and
++          used for the resulting DataFrame.
++        * If ``index`` is ``None`` – which happens after ``StructuralCleaner``
++          has removed rows – a fresh integer ``RangeIndex`` matching the array
++          length is used. This ensures the DataFrame always has the correct
++          number of rows and avoids ``ValueError`` from mismatched lengths.
++        """
         n_cols = array.shape[1] if array.ndim > 1 else 1
-        cols   = (
+        cols = (
             self._feature_names_out
             if len(self._feature_names_out) == n_cols
             else [f"feature_{i}" for i in range(n_cols)]
         )
-        actual_index = index[:len(array)]
+        if index is not None:
+            actual_index = index[: len(array)]
+        else:
+            # Create a default integer index matching the array length
+            actual_index = pd.RangeIndex(start=0, stop=len(array), step=1)
         return pd.DataFrame(array, columns=cols, index=actual_index)
 
     def _final_cleanup(self, df: pd.DataFrame) -> pd.DataFrame:
