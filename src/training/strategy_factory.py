@@ -8,7 +8,7 @@ lives as code.
 """
 
 from __future__ import annotations
-
+import warnings
 import logging
 from typing import Optional
 
@@ -20,14 +20,20 @@ logger = logging.getLogger("ml_platform.training.strategy_factory")
 # -- Availability checks ------------------------------------------------------
 
 try:
-    from xgboost import XGBClassifier, XGBRegressor  # noqa: F401
+    from xgboost import XGBClassifier, XGBRegressor
     XGBOOST_AVAILABLE = True
+       # Explicitly reference to silence Pylance
+    _ = XGBClassifier  # This tells Pylance "yes, I'm using it"
+    _ = XGBRegressor
 except ImportError:
     XGBOOST_AVAILABLE = False
 
 try:
     from lightgbm import LGBMClassifier, LGBMRegressor  # noqa: F401
     LIGHTGBM_AVAILABLE = True
+       # Explicitly reference to silence Pylance
+    _ = LGBMClassifier  # This tells Pylance "yes, I'm using it"
+    _ = LGBMRegressor
 except ImportError:
     LIGHTGBM_AVAILABLE = False
 
@@ -86,7 +92,7 @@ def _build_extreme_imbalance(
     spw_values = sorted(set([spw_low, int(spw), spw_high]))
     spw_values = [v for v in spw_values if v >= 1]
 
-    return ImbalanceStrategy(
+    strategy = ImbalanceStrategy(
         category=DatasetCategory.EXTREME_IMBALANCE.value,
         model_families=_filter_available(
             ["xgboost", "lightgbm", "random_forest", "gradient_boosting"]
@@ -101,7 +107,7 @@ def _build_extreme_imbalance(
             "xgboost": {"scale_pos_weight": spw_values},
             "lightgbm": {"is_unbalanced": [True]},
             "random_forest": {"class_weight": ["balanced_subsample"]},
-            "gradient_boosting": {"subsample": [0.6, 0.7, 0.8, 0.9]},
+            "gradient_boosting": {"subsample": [1.0]},
             "logistic_regression": {
                 "class_weight": ["balanced"],
                 "C": [0.01, 0.05, 0.1, 0.5, 1.0],
@@ -109,6 +115,15 @@ def _build_extreme_imbalance(
         },
         fit_extras={"early_stopping_rounds": 30},
     )
+
+    logger.info(
+        f"_build_extreme_imbalance: strategy built — "
+        f"spw={spw:.1f}, spw_values={spw_values}, "
+        f"model_families={strategy.model_families}, "
+        f"scoring={strategy.scoring_metric}, cv_folds={strategy.cv_folds}, "
+        f"class_weight={strategy.class_weight}, subsample_override=[1.0]"
+    )
+    return strategy
 
 
 # -- Severe Imbalance (1-5% minority) ----------------------------------------
@@ -122,14 +137,19 @@ def _build_severe_imbalance(
     spw_values = sorted(set([spw_low, int(spw), spw_high]))
     spw_values = [v for v in spw_values if v >= 1]
 
-    return ImbalanceStrategy(
+    logger.debug(
+        f"_build_severe_imbalance: spw={spw:.1f}, spw_values={spw_values}, "
+        f"n_samples={profile.n_samples}"
+    )
+
+    strategy = ImbalanceStrategy(
         category=DatasetCategory.SEVERE_IMBALANCE.value,
         model_families=_filter_available(
             ["xgboost", "lightgbm", "random_forest", "gradient_boosting",
              "logistic_regression"]
         ),
         scoring_metric="f1",
-        cv_folds=4,
+        cv_folds=4,  # noqa: E501
         class_weight="balanced_subsample",
         scale_pos_weight=spw,
         use_sample_weight=True,
@@ -148,12 +168,22 @@ def _build_severe_imbalance(
         fit_extras={"early_stopping_rounds": 20},
     )
 
+    logger.info(
+        f"_build_severe_imbalance: strategy built — "
+        f"spw={spw:.1f}, spw_values={spw_values}, "
+        f"model_families={strategy.model_families}, "
+        f"scoring={strategy.scoring_metric}, cv_folds={strategy.cv_folds}, "
+        f"class_weight={strategy.class_weight}"
+    )
+    return strategy
+
 
 # -- Moderate Imbalance (5-20% minority) -------------------------------------
 
 def _build_moderate_imbalance(
     profile: DatasetProfile, n_trials: int,
 ) -> ImbalanceStrategy:
+    logger.debug(f"_build_moderate_imbalance: n_samples={profile.n_samples}")
     return ImbalanceStrategy(
         category=DatasetCategory.MODERATE_IMBALANCE.value,
         model_families=_filter_available(

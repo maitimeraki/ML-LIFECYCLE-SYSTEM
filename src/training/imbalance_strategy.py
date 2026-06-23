@@ -10,8 +10,11 @@ what hyperparameter overrides to apply, and what fit-time extras
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from typing import Any, Optional
+
+logger = logging.getLogger("ml_platform.training.imbalance_strategy")
 
 
 @dataclass
@@ -86,11 +89,17 @@ class ImbalanceStrategy:
 
     def get_overrides(self, family: str) -> dict[str, Any]:
         """Get hyperparameter overrides for a specific model family."""
-        return self.search_space_overrides.get(family, {})
+        overrides = self.search_space_overrides.get(family, {})
+        logger.debug(
+            f"ImbalanceStrategy.get_overrides: family={family}, "
+            f"has_overrides={bool(overrides)}, "
+            f"keys={list(overrides.keys()) if overrides else 'none'}"
+        )
+        return overrides
 
     def summary(self) -> dict[str, Any]:
         """Human-readable summary for logging."""
-        return {
+        summary_dict = {
             "category": self.category,
             "model_families": self.model_families,
             "scoring_metric": self.scoring_metric,
@@ -100,3 +109,5 @@ class ImbalanceStrategy:
             "use_sample_weight": self.use_sample_weight,
             "is_unbalanced_lgbm": self.is_unbalanced_lgbm,
         }
+        logger.debug(f"ImbalanceStrategy.summary: {summary_dict}")
+        return summary_dict
