@@ -227,11 +227,17 @@ class ModelTrainer:
                 effective_hyperparams = dict(config.hyperparameters)
                 strategy = config.strategy
                 if strategy is not None:
-                    # Log the full strategy to MLflow for reproducibility
+                    # Log the full strategy to MLflow for reproducibility.
+                    # NOTE: class_weight/scale_pos_weight are already in
+                    # config.hyperparameters (logged at line 192). Only log
+                    # them from the strategy if they were NOT already present,
+                    # to avoid MLflow's "param already logged" error.
                     mlflow.log_param("dataset_category", strategy.category)
                     mlflow.log_param("is_imbalanced", strategy.needs_imbalance_handling)
-                    mlflow.log_param("class_weight", strategy.class_weight or "none")
-                    mlflow.log_param("scale_pos_weight", strategy.scale_pos_weight)
+                    if "class_weight" not in config.hyperparameters:
+                        mlflow.log_param("class_weight", strategy.class_weight or "none")
+                    if "scale_pos_weight" not in config.hyperparameters:
+                        mlflow.log_param("scale_pos_weight", strategy.scale_pos_weight)
                     mlflow.log_param("use_sample_weight", strategy.use_sample_weight)
                     if strategy.class_weight and "class_weight" not in effective_hyperparams:
                         effective_hyperparams["class_weight"] = strategy.class_weight
@@ -264,6 +270,7 @@ class ModelTrainer:
                     X, y,
                     test_size=config.test_size,
                     random_state=config.random_state,
+                    shuffle = True,
                     stratify=stratify_col,
                 )
 
@@ -325,7 +332,11 @@ class ModelTrainer:
                     n_total = len(y_train)
                     n_pos = int((y_train == 1).sum())
                     n_neg = n_total - n_pos
-                    if n_pos > 0:
+                    # GradientBoosting requires >= 2 classes. If the fold
+                    # trimmed to a single class (possible with extreme
+                    # imbalance + aggressive weighting), skip sample_weight
+                    # and let the model fit on what's left.
+                    if n_pos > 0 and n_neg > 0:
                         sample_weight = np.where(
                             y_train == 1,
                             n_total / (2.0 * n_pos),
@@ -336,6 +347,12 @@ class ModelTrainer:
                             f"Using sample_weight for imbalanced fit: "
                             f"pos_weight={n_total/(2*n_pos):.2f}, "
                             f"neg_weight={n_total/(2*n_neg):.2f}"
+                        )
+                    else:
+                        logger.warning(
+                            f"Skipping sample_weight: fold has only "
+                            f"{'positives' if n_pos > 0 else 'negatives'} "
+                            f"(n_pos={n_pos}, n_neg={n_neg})."
                         )
 
                 # Merge any extra fit kwargs from the strategy
