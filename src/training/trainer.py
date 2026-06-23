@@ -11,12 +11,13 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Optional, Protocol, TypeVar, runtime_checkable
+from typing import Any, Callable, Optional, Protocol, TypeVar, runtime_checkable, Self
 
 import joblib
 import mlflow
 import mlflow.sklearn
 import numpy as np
+from numpy.typing import ArrayLike
 import pandas as pd
 from sklearn.base import BaseEstimator
 from sklearn.model_selection import cross_val_score
@@ -32,24 +33,23 @@ from src.observability.metrics import (
 
 logger = logging.getLogger("ml_platform.training.trainer")
 
-@runtime_checkable
-class ModelProtocol(Protocol):
+class ModelProtocol(BaseEstimator):
     """
     Structural type matching ANY sklearn-compatible estimator.
     Includes BaseEstimator interface + ML interface.
     """
     # --- ML methods (Pylance needs these) ---
-    def fit(self, X: Any, y: Any, **kwargs: Any) -> ModelProtocol: ...
-    def predict(self, X: Any) -> Any: ...
-    def score(self, X: Any, y: Any) -> float: ...
+    def fit(self, X: ArrayLike, y: ArrayLike, **kwargs: Any) -> Self: ...
+    def predict(self, X: ArrayLike) -> Any: ...
+    def score(self, X: ArrayLike, y: ArrayLike) -> float: ...
     # --- BaseEstimator methods (runtime inheritance) ---
     def get_params(self, deep: bool = True) -> dict[str, Any]: ...
-    def set_params(self, **params: Any) -> ModelProtocol: ...
+    def set_params(self, **params: Any) -> Self: ...
     
-    # Allow any attribute (silences Pylance for unknown attrs)
-    def __getattr__(self, name:str)-> Any: ...
+   # Add sklearn-specific methods so they're not hidden
+    def predict_proba(self, X: ArrayLike) -> np.ndarray: ...
+    def __getattr__(self, name: str) -> Any: ...
 
-T = TypeVar('T', bound=ModelProtocol)
 
 @dataclass
 class TrainingConfig:
@@ -63,6 +63,10 @@ class TrainingConfig:
     test_size: float = 0.2
     stratify: bool = True
     tags: dict[str, str] = field(default_factory=dict)
+    is_imbalanced: bool = False
+    class_weight: Optional[str] = None  # "balanced", "balanced_subsample", or None
+    scale_pos_weight: float = 1.0  # For XGBoost/LightGBM: neg/pos ratio
+    strategy: Optional[Any] = None  # ImbalanceStrategy — set by AutoTrainer
 
 
 @dataclass
@@ -112,7 +116,7 @@ class ModelTrainer:
 
     def __init__(
         self,
-        model_factory: Callable[[dict[str, Any]], T],
+        model_factory: Callable[[dict[str, Any]], ModelProtocol],
         preprocessing_fn: Optional[Callable[[pd.DataFrame], pd.DataFrame]] = None,
         model_id: str = "",
         pipeline_run_id: str = "",
@@ -215,7 +219,42 @@ class ModelTrainer:
 
                 X = df[config.feature_columns].copy()
                 y = df[config.target_column].copy()
-                
+
+                # ── Imbalance-aware hyperparameter injection ──────────────────
+                # When the dataset is imbalanced, inject class_weight / scale_pos_weight
+                # into the model hyperparameters so the model learns to care about
+                # the minority class instead of just predicting the majority.
+                effective_hyperparams = dict(config.hyperparameters)
+                strategy = config.strategy
+                if strategy is not None:
+                    # Log the full strategy to MLflow for reproducibility
+                    mlflow.log_param("dataset_category", strategy.category)
+                    mlflow.log_param("is_imbalanced", strategy.needs_imbalance_handling)
+                    mlflow.log_param("class_weight", strategy.class_weight or "none")
+                    mlflow.log_param("scale_pos_weight", strategy.scale_pos_weight)
+                    mlflow.log_param("use_sample_weight", strategy.use_sample_weight)
+                    if strategy.class_weight and "class_weight" not in effective_hyperparams:
+                        effective_hyperparams["class_weight"] = strategy.class_weight
+                    if strategy.scale_pos_weight > 1.0 and "scale_pos_weight" not in effective_hyperparams:
+                        effective_hyperparams["scale_pos_weight"] = strategy.scale_pos_weight
+                    logger.info(
+                        f"Strategy active: category={strategy.category}, "
+                        f"class_weight={strategy.class_weight}, "
+                        f"spw={strategy.scale_pos_weight:.1f}"
+                    )
+                elif config.is_imbalanced:
+                    # Fallback: old boolean flag behavior
+                    if config.class_weight and "class_weight" not in effective_hyperparams:
+                        effective_hyperparams["class_weight"] = config.class_weight
+                    if config.scale_pos_weight > 1.0 and "scale_pos_weight" not in effective_hyperparams:
+                        effective_hyperparams["scale_pos_weight"] = config.scale_pos_weight
+                    mlflow.log_param("is_imbalanced", True)
+                    mlflow.log_param("class_weight", config.class_weight or "none")
+                    mlflow.log_param("scale_pos_weight", config.scale_pos_weight)
+                else:
+                    mlflow.log_param("is_imbalanced", False)
+                    mlflow.log_param("dataset_category", "balanced")
+
                 # Stratify if classification and not too many classes
                 stratify_col = (
                     y if config.stratify and y.nunique() < 50 else None
@@ -231,12 +270,30 @@ class ModelTrainer:
                 mlflow.log_param("training_samples",   len(X_train))
                 mlflow.log_param("validation_samples", len(X_val))
 
-                # Cross-validation
-                model: T = self.model_factory(config.hyperparameters)
+                # ── Build model with effective (possibly imbalance-adjusted) hyperparams ──
+                model: ModelProtocol = self.model_factory(effective_hyperparams)
+
+                # Cross-validation: use strategy's fold count when available,
+                # otherwise fall back to config with adaptive reduction
+                if strategy is not None:
+                    effective_cv_folds = strategy.cv_folds
+                else:
+                    effective_cv_folds = config.cv_folds
+                    if config.is_imbalanced and y_train.nunique() == 2:
+                        min_minority = int(y_train.value_counts().min())
+                        max_folds = max(3, min_minority // 2)
+                        if effective_cv_folds > max_folds:
+                            effective_cv_folds = max_folds
+                            logger.info(
+                                f"Reduced CV folds from {config.cv_folds} to "
+                                f"{effective_cv_folds} for imbalanced data "
+                                f"(minority count={min_minority})"
+                            )
+
                 # cross_val_score sees BaseEstimator at runtime (duck typing)
                 cv_scores = cross_val_score(
                     model, X_train, y_train,
-                    cv=config.cv_folds,
+                    cv=effective_cv_folds,
                     scoring=config.cv_scoring,
                     n_jobs=-1,
                 )
@@ -246,17 +303,49 @@ class ModelTrainer:
 
                 mlflow.log_metric("cv_mean", cv_mean)
                 mlflow.log_metric("cv_std",  cv_std)
+                mlflow.log_param("effective_cv_folds", effective_cv_folds)
 
                 for i, score in enumerate(cv_scores):
                     mlflow.log_metric(f"cv_fold_{i+1}", float(score))
-                
-        
-                # Pylance sees .fit(), .predict(), .score() via Protocol
-                # Full training
-                model.fit(X_train, y_train)
+
+
+                # Full training — use sample_weight for imbalanced data on
+                # models that support it (GradientBoosting, etc.)
+                fit_kwargs: dict[str, Any] = {}
+                use_sw = (
+                    strategy is not None
+                    and strategy.use_sample_weight
+                    and y_train.nunique() == 2
+                ) or (
+                    strategy is None
+                    and config.is_imbalanced
+                    and y_train.nunique() == 2
+                )
+                if use_sw:
+                    n_total = len(y_train)
+                    n_pos = int((y_train == 1).sum())
+                    n_neg = n_total - n_pos
+                    if n_pos > 0:
+                        sample_weight = np.where(
+                            y_train == 1,
+                            n_total / (2.0 * n_pos),
+                            n_total / (2.0 * n_neg),
+                        )
+                        fit_kwargs["sample_weight"] = sample_weight
+                        logger.info(
+                            f"Using sample_weight for imbalanced fit: "
+                            f"pos_weight={n_total/(2*n_pos):.2f}, "
+                            f"neg_weight={n_total/(2*n_neg):.2f}"
+                        )
+
+                # Merge any extra fit kwargs from the strategy
+                if strategy is not None and strategy.fit_extras:
+                    fit_kwargs.update(strategy.fit_extras)
+
+                model.fit(X_train, y_train, **fit_kwargs)
 
                 # Validation metrics
-                metrics = self._compute_metrics(model, X_val, y_val, config)
+                metrics = self._compute_metrics(model, X_val, y_val, config, strategy)
                 for metric_name, metric_value in metrics.items():
                     mlflow.log_metric(metric_name, metric_value)
 
@@ -437,6 +526,7 @@ class ModelTrainer:
         X_val: pd.DataFrame,
         y_val: pd.Series,
         config: TrainingConfig,
+        strategy
     ) -> dict[str, float]:
         from sklearn.metrics import (              
             accuracy_score, f1_score, precision_score, recall_score,
@@ -449,29 +539,50 @@ class ModelTrainer:
         is_classification = hasattr(model, "predict_proba") or y_val.nunique() <= 20
 
         if is_classification:
+            n_classes = y_val.nunique()
+            is_binary  = n_classes == 2
+            # For binary: use "binary" average (focuses on positive class)
+            # For multiclass: use "macro" (equal weight to all classes)
+            avg = "binary" if is_binary else "macro"
+
             metrics["accuracy"]  = float(accuracy_score(y_val, y_pred))
-            average              = "binary" if y_val.nunique() == 2 else "weighted"
             metrics["f1_score"]  = float(
-                f1_score(y_val, y_pred, average=average, zero_division=0)
+                f1_score(y_val, y_pred, average=avg, zero_division=0)
             )
-            metrics["precision"] = float(          
-                precision_score(y_val, y_pred, average=average, zero_division=0)
+            metrics["precision"] = float(
+                precision_score(y_val, y_pred, average=avg, zero_division=0)
             )
             metrics["recall"]    = float(
-                recall_score(y_val, y_pred, average=average, zero_division=0)
+                recall_score(y_val, y_pred, average=avg, zero_division=0)
             )
+            # For imbalanced data, also report F1 with macro average
+            # so the user sees per-class performance
+            is_imbalanced = (
+                (strategy is not None and strategy.needs_imbalance_handling)
+                or (strategy is None and config.is_imbalanced)
+            )
+            if is_imbalanced and is_binary:
+                metrics["f1_macro"] = float(
+                    f1_score(y_val, y_pred, average="macro", zero_division=0)
+                )
             if hasattr(model, "predict_proba"):
                 try:
                     y_prob = model.predict_proba(X_val)
-                    if y_val.nunique() == 2:
-                        metrics["roc_auc"] = float(   
+                    if is_binary:
+                        metrics["roc_auc"] = float(
                             roc_auc_score(y_val, y_prob[:, 1])
                         )
+                        # PR-AUC is the gold standard for imbalanced data
+                        # It focuses on minority class performance
+                        from sklearn.metrics import average_precision_score
+                        metrics["pr_auc"] = float(
+                            average_precision_score(y_val, y_prob[:, 1])
+                        )
                     else:
-                        metrics["roc_auc"] = float( 
+                        metrics["roc_auc"] = float(
                             roc_auc_score(
                                 y_val, y_prob,
-                                multi_class="ovr", average="weighted"
+                                multi_class="ovr", average="macro"
                             )
                         )
                 except Exception:
@@ -502,7 +613,7 @@ class ModelTrainer:
         )
 
     def _save_model_artifact(
-        self, model: ModelProtocol, model_id: str, version: str
+        self, model: BaseEstimator, model_id: str, version: str
     ) -> str:
         models_dir = self.settings.models_dir
         models_dir.mkdir(parents=True, exist_ok=True)
