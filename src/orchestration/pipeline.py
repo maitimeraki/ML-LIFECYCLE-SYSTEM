@@ -736,7 +736,15 @@ with DAG(
     @airflow_task(task_id="train_model")
     def train_model(**context) -> dict[str, Any]:
         """
-        Train new model on processed production data.
+        Train new model on processed production data with automatic
+        hyperparameter optimization.
+
+        Delegates to AutoTrainer.auto_train() which:
+          1. Analyzes the dataset (problem type, class balance, size)
+          2. Selects candidate model families adaptively
+          3. Runs multi-stage HPO (Optuna TPE or sklearn fallback)
+          4. Selects the best family + params
+          5. Trains the final model via ModelTrainer with MLflow tracking
 
         Data is already processed (from process_both_datasets task).
         No duplicate processing here.
@@ -747,29 +755,24 @@ with DAG(
         # import sys
         # sys.path.insert(0, "/opt/airflow/ml_platform")
 
-        from sklearn.ensemble import GradientBoostingClassifier
-        from src.training.trainer import ModelTrainer, TrainingConfig
+        from src.training.hyperparameter_tuner import (
+            AutoTrainer,
+            TuningConfig,
+        )
+        from src.training.trainer import TrainingConfig
 
-        ti           = context["task_instance"]
+        ti            = context["task_instance"]
         decision_xcom = ti.xcom_pull(task_ids="make_retrain_decision")
-        run_id       = decision_xcom["run_id"]
-        model_version   = decision_xcom["model_version"]
+        run_id        = decision_xcom["run_id"]
+        model_version = decision_xcom["model_version"]
 
         # Load already-processed production data
         prod_processed = pd.read_parquet(
-            decision_xcom["prod_processed_path"] # Loading processed production df from temporary storage for the DAG run
+            decision_xcom["prod_processed_path"]
         )
 
         logger.info(
-            f"Training on {len(prod_processed)} processed production rows."
-        )
-
-        # Training config from Airflow Variables
-        n_estimators = int(
-            Variable.get("n_estimators", default="100")
-        )
-        max_depth    = int(
-            Variable.get("max_depth", default="10")
+            f"Auto-training on {len(prod_processed)} processed production rows."
         )
 
         # Feature columns = all columns except target
@@ -778,49 +781,55 @@ with DAG(
             if c != TARGET_COLUMN
         ]
 
-        config = TrainingConfig(
-            model_type="gradient_boosting",
-            hyperparameters={
-                "n_estimators":  n_estimators,
-                "max_depth":     max_depth,
-                "learning_rate": 0.1,
-                "random_state":  42,
-            },
+        # Base training config — hyperparameters auto-discovered by AutoTrainer
+        base_config = TrainingConfig(
+            model_type="auto",
+            hyperparameters={},  # AutoTrainer fills these
             feature_columns=feature_cols,
             target_column=TARGET_COLUMN,
-            cv_folds=5,
-            cv_scoring="f1_weighted",
+            cv_folds=int(Variable.get("tuning_cv_folds", default="5")),
+            cv_scoring="",  # AutoTrainer picks optimal scorer from dataset profile
             tags={
                 "airflow_run_id":  context["run_id"],
                 "pipeline_run_id": run_id,
                 "trained_on":      "production_data",
+                "auto_tuned":      "true",
             },
         )
 
-        # new_version = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-        # Define the factory type explicitly               
-        def model_factory(hp: Dict[str, Any])->Any:
-            return GradientBoostingClassifier(**hp)
+        # Tuning config from Airflow Variables (with sensible defaults)
+        tuning_config = TuningConfig(
+            model_families=[],        # empty → AutoTrainer auto-selects
+            n_trials=int(Variable.get("tuning_n_trials", default="30")),
+            timeout_seconds=int(Variable.get("tuning_timeout_seconds", default="600")),
+            cv_folds=int(Variable.get("tuning_cv_folds", default="5")),
+            primary_metric="",        # empty → AutoTrainer picks from dataset profile
+            search_strategy="auto",   # auto → Optuna if available, else sklearn
+            early_stopping_rounds=int(Variable.get("tuning_early_stopping", default="10")),
+        )
 
-        trainer = ModelTrainer(
-            model_factory=model_factory,
-            preprocessing_fn= None,  # Already preprocessed
+        auto_trainer = AutoTrainer(
             model_id=MODEL_ID,
             pipeline_run_id=run_id,
+            model_version = model_version
         )
 
-        result = trainer.train(
+        auto_result = auto_trainer.auto_train(
             df=prod_processed,
-            config=config,
-            model_id=MODEL_ID,
-            model_version=model_version,
+            config=base_config,
+            tuning_config=tuning_config,
         )
+
+        result = auto_result.training_result
 
         logger.info(
-            f"Training complete: v={model_version}, "
+            f"Auto-training complete: v={model_version}, "
+            f"best_family={auto_result.best_family}, "
             f"cv={result.cv_mean:.4f}, "
             f"metrics={result.metrics}, "
-            f"mlflow={result.mlflow_run_id}"
+            f"mlflow={result.mlflow_run_id}, "
+            f"trials={auto_result.total_trials}, "
+            f"duration={auto_result.total_tuning_duration_seconds:.1f}s"
         )
 
         # Update Airflow Variable for tracking
@@ -833,7 +842,10 @@ with DAG(
             "cv_mean":           result.cv_mean,
             "cv_std":            result.cv_std,
             "metrics":           result.metrics,
-            "hyperparameters":    config.hyperparameters,
+            "hyperparameters":    auto_result.best_params,
+            "best_family":       auto_result.best_family,
+            "tuning_trials":     auto_result.total_trials,
+            "tuning_duration":   auto_result.total_tuning_duration_seconds,
             "artifact_path":     result.model_artifact_path,
             "training_samples":  result.training_samples,
             "validation_samples": result.validation_samples,
