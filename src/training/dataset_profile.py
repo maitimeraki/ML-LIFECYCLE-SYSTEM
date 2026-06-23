@@ -10,12 +10,15 @@ search space builder, trainer) can make informed decisions.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional
 
 import numpy as np
 import pandas as pd
+
+logger = logging.getLogger("ml_platform.training.dataset_profile")
 
 
 class DatasetCategory(str, Enum):
@@ -118,35 +121,52 @@ def classify_dataset(
     DatasetCategory
         The determined category.
     """
+    logger.debug(
+        f"classify_dataset: is_classification={is_classification}, "
+        f"n_classes={n_classes}, class_balance_ratio={class_balance_ratio:.6f}, "
+        f"n_samples={n_samples}"
+    )
+
     if not is_classification:
         if n_samples < REGRESSION_SMALL_THRESHOLD:
-            return DatasetCategory.REGRESSION_SMALL
+            category = DatasetCategory.REGRESSION_SMALL
         elif n_samples < REGRESSION_LARGE_THRESHOLD:
-            return DatasetCategory.REGRESSION_MEDIUM
+            category = DatasetCategory.REGRESSION_MEDIUM
         else:
-            return DatasetCategory.REGRESSION_LARGE
+            category = DatasetCategory.REGRESSION_LARGE
+        logger.debug(f"classify_dataset: regression → {category.value}")
+        return category
 
     # Classification
     if n_classes is None or n_classes < 2:
+        logger.debug(f"classify_dataset: n_classes={n_classes} → balanced_binary")
         return DatasetCategory.BALANCED_BINARY
 
     if n_classes == 2:
         if class_balance_ratio < EXTREME_IMBALANCE_THRESHOLD:
-            return DatasetCategory.EXTREME_IMBALANCE
+            category = DatasetCategory.EXTREME_IMBALANCE
         elif class_balance_ratio < SEVERE_IMBALANCE_THRESHOLD:
-            return DatasetCategory.SEVERE_IMBALANCE
+            category = DatasetCategory.SEVERE_IMBALANCE
         elif class_balance_ratio < MODERATE_IMBALANCE_THRESHOLD:
-            return DatasetCategory.MODERATE_IMBALANCE
+            category = DatasetCategory.MODERATE_IMBALANCE
         elif class_balance_ratio < MILD_IMBALANCE_THRESHOLD:
-            return DatasetCategory.MILD_IMBALANCE
+            category = DatasetCategory.MILD_IMBALANCE
         else:
-            return DatasetCategory.BALANCED_BINARY
+            category = DatasetCategory.BALANCED_BINARY
+        logger.debug(
+            f"classify_dataset: binary, ratio={class_balance_ratio:.6f} → {category.value}"
+        )
+        return category
     else:
         # Multiclass
         if class_balance_ratio < MILD_IMBALANCE_THRESHOLD:
-            return DatasetCategory.MULTICLASS_IMBALANCED
+            category = DatasetCategory.MULTICLASS_IMBALANCED
         else:
-            return DatasetCategory.MULTICLASS_BALANCED
+            category = DatasetCategory.MULTICLASS_BALANCED
+        logger.debug(
+            f"classify_dataset: multiclass, ratio={class_balance_ratio:.6f} → {category.value}"
+        )
+        return category
 
 
 @dataclass
@@ -269,11 +289,24 @@ class DatasetProfile:
                 problem_subtype = "regression_large"
             recommended_scoring = "neg_root_mean_squared_error"
 
+        logger.debug(
+            f"from_dataframe: computing category — "
+            f"is_classification={is_classification}, n_classes={n_classes}, "
+            f"class_balance_ratio={class_balance_ratio:.6f}, n_samples={n_samples}"
+        )
+
         category = classify_dataset(
             is_classification=is_classification,
             n_classes=n_classes,
             class_balance_ratio=class_balance_ratio,
             n_samples=n_samples,
+        )
+
+        logger.info(
+            f"from_dataframe: category={category.value}, "
+            f"is_classification={is_classification}, n_classes={n_classes}, "
+            f"class_balance_ratio={class_balance_ratio:.6f}, "
+            f"scale_pos_weight={spw:.1f}, minority_counts={minority_counts}"
         )
 
         feature_types = {}
