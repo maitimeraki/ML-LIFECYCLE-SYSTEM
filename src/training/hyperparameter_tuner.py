@@ -60,6 +60,7 @@ from sklearn.model_selection import (
 )
 from sklearn.metrics import (
     accuracy_score,
+    average_precision_score,
     f1_score,
     precision_score,
     recall_score,
@@ -112,7 +113,10 @@ except ImportError:
     LIGHTGBM_AVAILABLE = False
 
 try:
-    from sklearn.experimental import enable_halving_search_cv  # noqa
+    import sklearn
+    # explicitly require this experimental feature
+    from sklearn.experimental import enable_halving_search_cv # noqa
+    # now you can import normally from model_selection
     from sklearn.model_selection import HalvingRandomSearchCV
     HALVING_AVAILABLE = True
 except ImportError:
@@ -624,7 +628,18 @@ class AutoTrainer:
             # class_weight, scale_pos_weight, search space overrides, fit extras.
             strategy = get_strategy(profile, tuning_config.n_trials)
             logger.info(
-                f"Strategy: {strategy.summary()}"
+                f"Strategy selected: category={strategy.category}, "
+                f"scoring_metric={strategy.scoring_metric}, "
+                f"cv_folds={strategy.cv_folds}, "
+                f"model_families={strategy.model_families}, "
+                f"class_weight={strategy.class_weight}, "
+                f"scale_pos_weight={strategy.scale_pos_weight:.1f}, "
+                f"use_sample_weight={strategy.use_sample_weight}, "
+                f"is_unbalanced_lgbm={strategy.is_unbalanced_lgbm}"
+            )
+            logger.debug(
+                f"Strategy search_space_overrides={strategy.search_space_overrides}, "
+                f"fit_extras={strategy.fit_extras}"
             )
 
             # Step 3: Determine model families from strategy
@@ -792,7 +807,16 @@ class AutoTrainer:
             f"samples={profile.n_samples}, features={profile.n_features}, "
             f"balance={profile.class_balance_ratio:.4f}, "
             f"scale_pos_weight={profile.scale_pos_weight:.1f}, "
-            f"families={profile.recommended_families}"
+            f"minority_class_counts={profile.minority_class_counts}, "
+            f"recommended_families={profile.recommended_families}, "
+            f"recommended_scoring={profile.recommended_scoring}"
+        )
+        logger.debug(
+            f"Dataset profile details: is_classification={profile.is_classification}, "
+            f"is_multiclass={profile.is_multiclass}, "
+            f"has_imbalanced_classes={profile.has_imbalanced_classes}, "
+            f"per_class_scale_weights={profile.per_class_scale_weights}, "
+            f"memory_mb={profile.memory_mb:.2f}"
         )
 
         # Warn for extreme imbalance
@@ -860,16 +884,35 @@ class AutoTrainer:
             n_samples=profile.n_samples,
         )
 
+        logger.debug(
+            f"[{family}] Base search space keys: {list(sklearn_space.keys())}, "
+            f"is_classification={profile.is_classification}, "
+            f"is_imbalanced={profile.has_imbalanced_classes}, "
+            f"n_samples={profile.n_samples}"
+        )
+
         # Merge strategy overrides into the search space
         overrides = strategy.get_overrides(family)
         if overrides:
             sklearn_space = AutoTrainer._merge_overrides(sklearn_space, overrides)
-            # For Optuna, overrides are applied inside the objective via the
-            # strategy object passed as a closure variable.
+            logger.info(
+                f"[{family}] Strategy overrides applied: {list(overrides.keys())}"
+            )
+            logger.debug(
+                f"[{family}] Override details: {overrides}"
+            )
+        else:
+            logger.debug(f"[{family}] No strategy overrides applied")
 
         search_strategy = tuning_config.search_strategy
         if search_strategy == "auto":
             search_strategy = "optuna" if OPTUNA_AVAILABLE else "sklearn"
+
+        logger.info(
+            f"[{family}] Starting tuning: search_strategy={search_strategy}, "
+            f"primary_metric={primary_metric}, cv_folds={strategy.cv_folds}, "
+            f"n_trials={tuning_config.n_trials}, n_jobs={tuning_config.n_jobs}"
+        )
 
         if search_strategy == "optuna" and OPTUNA_AVAILABLE:
             result = self._tune_with_optuna(
@@ -889,6 +932,15 @@ class AutoTrainer:
         if TUNING_DURATION:
             TUNING_DURATION.labels(model_id=self.model_id, model_family=family).observe(result.tuning_duration_seconds)
 
+        logger.info(
+            f"[{family}] Tuning complete: status={result.status}, "
+            f"best_score={result.best_score:.6f}, best_std={result.best_std:.6f}, "
+            f"trials_completed={result.n_trials_completed}, trials_pruned={result.n_trials_pruned}, "
+            f"duration={result.tuning_duration_seconds:.2f}s"
+        )
+        if result.error_message:
+            logger.warning(f"[{family}] Tuning error: {result.error_message}")
+
         return result
 
     @staticmethod
@@ -905,12 +957,24 @@ class AutoTrainer:
         return float(n_negative / n_positive)
 
     def _tune_with_optuna(
-        self, family, df, config, tuning_config, profile,
-        primary_metric, optuna_space_fn, strategy, overrides,
-    ):
+        self, family:str, df: pd.DataFrame, config: TrainingConfig, tuning_config: TuningConfig, profile: DatasetProfile,
+        primary_metric: str, optuna_space_fn: Any, strategy: ImbalanceStrategy, overrides: Dict[str, Any]
+    )-> FamilyTuningResult:
         """Optuna-based hyperparameter optimization with pruning."""
+        logger.info(
+            f"[{family}] _tune_with_optuna entered: primary_metric={primary_metric}, "
+            f"n_trials={tuning_config.n_trials}, timeout={tuning_config.timeout_seconds}s, "
+            f"cv_folds={strategy.cv_folds}"
+        )
+
         X = df[config.feature_columns].values
         y = df[config.target_column].values
+        y = np.asarray(y) # ->
+
+        logger.debug(
+            f"[{family}] Input data: X.shape={X.shape}, y.shape={y.shape}, "
+            f"y.dtype={y.dtype}"
+        )
 
         label_encoder = None
         if profile.is_classification and y.dtype == object:
@@ -933,6 +997,12 @@ class AutoTrainer:
             cv = StratifiedKFold(n_splits=cv_folds, shuffle=True, random_state=tuning_config.random_state)
         else:
             cv = KFold(n_splits=cv_folds, shuffle=True, random_state=tuning_config.random_state)
+
+        # sklearn has no "pr_auc" string alias — convert to a callable scorer
+        if primary_metric == "pr_auc":
+            scoring = make_scorer(average_precision_score, needs_proba=True)
+        else:
+            scoring = primary_metric
 
         all_trials: list[TrialResult] = []
         best_score = -np.inf
@@ -962,11 +1032,18 @@ class AutoTrainer:
                 trial_start = time.time()
                 with warnings.catch_warnings():
                     warnings.simplefilter("ignore")
-                    scores = cross_val_score(model, X, y, cv=cv, scoring=primary_metric, n_jobs=1)
+                    scores = cross_val_score(model, X, y, cv=cv, scoring=scoring, n_jobs=1)
                 fit_time = time.time() - trial_start
 
-                mean_score = float(np.mean(scores))
-                std_score = float(np.std(scores))
+                # average_precision_score returns nan when a fold has no
+                # positive samples. Use nanmean so a single nan fold doesn't
+                # poison the whole trial's mean.
+                if np.all(np.isnan(scores)):
+                    mean_score = -np.nan
+                    std_score = float("nan")
+                else:
+                    mean_score = float(np.nanmean(scores))
+                    std_score = float(np.nanstd(scores))
 
                 trial.report(mean_score, step=0)
                 if trial.should_prune():
@@ -1019,6 +1096,12 @@ class AutoTrainer:
                     ).inc()
                 return -np.inf
 
+        logger.debug(
+            f"[{family}] Creating Optuna study: direction=maximize, "
+            f"sampler=TPE(multivariate=True), pruner=MedianPruner(n_startup=5), "
+            f"seed={tuning_config.random_state}"
+        )
+
         study = optuna.create_study(
             direction="maximize",
             sampler=TPESampler(seed=tuning_config.random_state, multivariate=True),
@@ -1032,6 +1115,13 @@ class AutoTrainer:
             show_progress_bar=False, catch=(Exception,),
         )
 
+        logger.info(
+            f"[{family}] Optuna study completed: "
+            f"n_trials={len(study.trials)}, "
+            f"best_value={study.best_value if study.best_trial else 'N/A'}, "
+            f"n_pruned={sum(1 for t in study.trials if t.state == optuna.trial.TrialState.PRUNED)}"
+        )
+
         return FamilyTuningResult(
             model_family=family, best_params=best_params,
             best_score=best_score if best_score != -np.inf else 0.0,
@@ -1042,16 +1132,30 @@ class AutoTrainer:
         )
 
     def _tune_with_sklearn(
-        self, family, df, config, tuning_config, profile,
-        primary_metric, sklearn_space, strategy,
+        self, family: str, df: pd.DataFrame, config: TrainingConfig, tuning_config: TuningConfig, profile,
+        primary_metric: str, sklearn_space: Dict[str,Any], strategy: ImbalanceStrategy,
     ):
         """Sklearn-based hyperparameter search (fallback when Optuna unavailable)."""
+        logger.info(
+            f"[{family}] _tune_with_sklearn entered: primary_metric={primary_metric}, "
+            f"search_space_keys={list(sklearn_space.keys())}, "
+            f"halving_available={HALVING_AVAILABLE}"
+        )
+
         X = df[config.feature_columns].values
         y = df[config.target_column].values
 
+        logger.debug(
+            f"[{family}] Input data: X.shape={X.shape}, y.shape={y.shape}, "
+            f"y.dtype={y.dtype}, y.unique={np.unique(y)[:10]}"
+        )
+
         if profile.is_classification and y.dtype == object:
             label_encoder = LabelEncoder()
-            y = label_encoder.fit_transform(y)
+            y = label_encoder.fit_transform(np.asarray(y))
+            logger.debug(
+                f"[{family}] Label-encoded y: classes={label_encoder.classes_.tolist()}"
+            )
 
         factory_info = MODEL_FACTORIES[family]
         model_cls = factory_info["classifier"] if profile.is_classification else factory_info["regressor"]
@@ -1062,6 +1166,12 @@ class AutoTrainer:
                 n_trials_completed=0, n_trials_pruned=0, status="failed",
                 error_message=f"{family} does not support this problem type",
             )
+
+        # sklearn has no "pr_auc" string alias — convert to a callable scorer
+        if primary_metric == "pr_auc":
+            scoring = make_scorer(average_precision_score, needs_proba=True)
+        else:
+            scoring = primary_metric
 
         base_model = model_cls(random_state=tuning_config.random_state)
         # Filter out params that this model doesn't understand
@@ -1079,23 +1189,58 @@ class AutoTrainer:
         # Use strategy's CV fold count (reduced for extreme imbalance)
         cv_folds = strategy.cv_folds
 
+        logger.debug(
+            f"[{family}] Search config: n_iter={n_iter}, cv_folds={cv_folds}, "
+            f"clean_space_keys={list(clean_space.keys())}, "
+            f"n_jobs={tuning_config.n_jobs}, factor=3, min_resources=smallest"
+        )
+
+        # Guard: with extreme imbalance, even StratifiedKFold can produce
+        # folds with 0 positives when the absolute minority count is tiny.
+        # Ensure each fold contains at least MIN_FOLD_POSITIVES minority
+        # samples. If not, reduce fold count until it does.
+        MIN_FOLD_POSITIVES = 2
+        if profile.is_classification and profile.has_imbalanced_classes:
+            # Estimate minority count from class_balance_ratio if
+            # minority_class_counts is empty or unreliable
+            minority_count = 0
+            if profile.minority_class_counts:
+                minority_count = min(profile.minority_class_counts.values())
+            if minority_count == 0 and profile.class_balance_ratio > 0:
+                minority_count = max(1, int(profile.class_balance_ratio * profile.n_samples))
+            max_safe_folds = max(2, minority_count // MIN_FOLD_POSITIVES)
+            if cv_folds > max_safe_folds:
+                logger.warning(
+                    f"Reducing CV folds from {cv_folds} to {max_safe_folds} "
+                    f"for {family}: minority_count={minority_count}, "
+                    f"need >= {MIN_FOLD_POSITIVES} positives per fold."
+                )
+                cv_folds = max_safe_folds
+
         if HALVING_AVAILABLE:
             search = HalvingRandomSearchCV(
                 estimator=base_model, param_distributions=clean_space,
                 n_candidates=n_iter, cv=cv_folds,
-                scoring=primary_metric, random_state=tuning_config.random_state,
+                scoring=scoring, random_state=tuning_config.random_state,
                 n_jobs=tuning_config.n_jobs, factor=3, min_resources="smallest",
                 error_score=np.nan,
             )
         else:
+            logger.warning("HalvingRandomSearchCV is not available!!")
             from sklearn.model_selection import RandomizedSearchCV
             search = RandomizedSearchCV(
                 estimator=base_model, param_distributions=clean_space,
                 n_iter=n_iter, cv=cv_folds,
-                scoring=primary_metric, random_state=tuning_config.random_state,
+                scoring=scoring, random_state=tuning_config.random_state,
                 n_jobs=tuning_config.n_jobs,
                 error_score=np.nan,
             )
+
+        logger.info(
+            f"[{family}] Starting search.fit: search_type="
+            f"{'HalvingRandomSearchCV' if HALVING_AVAILABLE else 'RandomizedSearchCV'}, "
+            f"n_candidates={n_iter}, cv={cv_folds}, scoring={primary_metric}"
+        )
 
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
@@ -1103,7 +1248,7 @@ class AutoTrainer:
                 search.fit(X, y)
             except Exception as e:
                 logger.warning(
-                    f"Sklearn search failed for {family}: {e}. "
+                    f"[{family}] Sklearn search failed: {e}. "
                     f"Returning empty result."
                 )
                 return FamilyTuningResult(
@@ -1132,6 +1277,28 @@ class AutoTrainer:
                 model_id=self.model_id, model_family=family, status="completed"
             ).inc(n_trials_actual)
 
+        best_score = float(search.best_score_)
+        logger.info(
+            f"[{family}] search.fit completed: best_score={best_score:.6f}, "
+            f"best_params={search.best_params_}, "
+            f"n_trials_actual={len(cv_results['params'])}"
+        )
+        # If every trial's mean was nan (e.g. PR-AUC on folds with no
+        # positives), sklearn returns nan as best_score. Report as failed.
+        if np.isnan(best_score):
+            logger.warning(
+                f"[{family}] All trials produced nan scores "
+                f"(likely single-class folds with PR-AUC scoring)."
+            )
+            return FamilyTuningResult(
+                model_family=family, best_params={}, best_score=0.0,
+                best_std=0.0, primary_metric=primary_metric,
+                all_trials=all_trials, tuning_duration_seconds=0,
+                n_trials_completed=n_trials_actual, n_trials_pruned=0,
+                status="failed",
+                error_message="All trials produced nan scores — folds may be too small for the minority class.",
+            )
+
         return FamilyTuningResult(
             model_family=family, best_params=search.best_params_,
             best_score=float(search.best_score_),
@@ -1146,9 +1313,20 @@ class AutoTrainer:
     def _select_best(self, family_results: Dict[str, FamilyTuningResult]):
         """Select the best model family from tuning results."""
         valid = {n: r for n, r in family_results.items() if r.status == "completed" and r.best_params}
+        logger.info(
+            f"_select_best: {len(family_results)} families evaluated, "
+            f"{len(valid)} valid: {list(valid.keys())}"
+        )
+        for name, r in family_results.items():
+            logger.debug(
+                f"  {name}: status={r.status}, best_score={r.best_score:.6f}, "
+                f"best_std={r.best_std:.6f}, n_trials={r.n_trials_completed}"
+            )
         if not valid:
+            logger.warning("_select_best: no valid results — all families failed")
             return "", None
         sorted_families = sorted(valid.items(), key=lambda x: (x[1].best_score, -x[1].best_std), reverse=True)
+        logger.info(f"_select_best: winner={sorted_families[0][0]}, score={sorted_families[0][1].best_score:.6f}")
         return sorted_families[0]
 
     def _build_model_factory(self, family: str, is_classification:bool):
