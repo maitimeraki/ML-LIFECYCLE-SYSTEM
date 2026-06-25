@@ -723,6 +723,10 @@ class AutoTrainer:
                 class_weight=strategy.class_weight,
                 scale_pos_weight=strategy.scale_pos_weight,
                 strategy=strategy,
+                # Phase 2: propagate advanced-technique flags from strategy
+                enable_feature_engineering=getattr(strategy, "enable_feature_engineering", False),
+                enable_calibration=getattr(strategy, "enable_calibration", False),
+                enable_ensemble=getattr(strategy, "enable_ensemble", False),
             )
 
             model_factory = self._build_model_factory(best_family, profile.is_classification)
@@ -1224,7 +1228,9 @@ class AutoTrainer:
             and not (k == "class_weight" and not profile.is_classification)
             and not (k == "scale_pos_weight" and "scale_pos_weight" not in valid_params)
         }
-        n_iter = min(tuning_config.n_trials, 30)
+        # Phase 2: increased trial cap for better exploration.
+        # Extreme imbalance needs more trials to find the right SPW + threshold.
+        n_iter = min(tuning_config.n_trials, 100)
 
         # Use strategy's CV fold count (reduced for extreme imbalance)
         cv_folds = strategy.cv_folds
