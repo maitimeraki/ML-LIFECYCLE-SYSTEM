@@ -87,10 +87,35 @@ def _build_extreme_imbalance(
     profile: DatasetProfile, n_trials: int,
 ) -> ImbalanceStrategy:
     spw = profile.scale_pos_weight
-    spw_low = max(1, int(spw * 0.8))
-    spw_high = int(spw * 1.2)
-    spw_values = sorted(set([spw_low, int(spw), spw_high]))
+    spw_low = max(1, int(spw * 0.5))
+    spw_high = int(spw * 1.5)
+    # More scale_pos_weight candidates for Optuna to explore — the
+    # optimal SPW is rarely exactly neg/pos; it's usually 0.3-0.7×
+    # that for tree models (XGBoost docs: "typically sqrt of spw").
+    spw_sqrt = max(1, int(spw ** 0.5))
+    spw_values = sorted(set([spw_low, spw_sqrt, int(spw), spw_high]))
     spw_values = [v for v in spw_values if v >= 1]
+
+    # For extreme imbalance, the minority class is tiny.  We need
+    # per-model tweaks that are *specific* to this severity level:
+    #
+    # XGBoost:
+    #   - max_delta_step: prevents the first split from being too
+    #     aggressive (critical when pos/neg > 100:1).  Default 0
+    #     means unbounded — trees over-correct on the first iteration.
+    #   - min_child_weight: lower than default 1 so sparse minority
+    #     leaf nodes can form.
+    #
+    # LightGBM:
+    #   - min_child_samples: must be very low (1-5) so minority-only
+    #     leaves can be created.  Default 20 kills all splits.
+    #   - max_delta_step: same rationale as XGBoost.
+    #
+    # RandomForest:
+    #   - min_samples_leaf: lower bound so minority leaves survive.
+    #
+    # GradientBoosting (sklearn):
+    #   - min_samples_leaf: same as RF.
 
     strategy = ImbalanceStrategy(
         category=DatasetCategory.EXTREME_IMBALANCE.value,
@@ -104,18 +129,24 @@ def _build_extreme_imbalance(
         use_sample_weight=True,
         is_unbalanced_lgbm=True,
         search_space_overrides={
-            "xgboost": {"scale_pos_weight": spw_values},
-            "lightgbm": {
-                # LightGBM 4.6+ does not support `is_unbalanced`; use
-                # `scale_pos_weight` instead (native LightGBM param).
+            "xgboost": {
                 "scale_pos_weight": spw_values,
-                # Extreme imbalance + default min_child_samples=20 means trees
-                # stop after 1-2 splits (the minority group is < 20 samples).
-                # Lower it so leaves can split on small minority clusters.
-                "min_child_samples": [5, 10],
+                "max_delta_step": [1, 3, 5, 7],
+                "min_child_weight": [1, 3, 5],
             },
-            "random_forest": {"class_weight": ["balanced_subsample"]},
-            "gradient_boosting": {"subsample": [1.0]},
+            "lightgbm": {
+                "scale_pos_weight": spw_values,
+                "min_child_samples": [1, 3, 5, 10],
+                "max_delta_step": [1, 3, 5],
+            },
+            "random_forest": {
+                "class_weight": ["balanced_subsample"],
+                "min_samples_leaf": [1, 2, 5],
+            },
+            "gradient_boosting": {
+                "subsample": [1.0],
+                "min_samples_leaf": [1, 2, 5],
+            },
             "logistic_regression": {
                 "class_weight": ["balanced"],
                 "C": [0.01, 0.05, 0.1, 0.5, 1.0],
@@ -126,7 +157,7 @@ def _build_extreme_imbalance(
 
     logger.info(
         f"_build_extreme_imbalance: strategy built — "
-        f"spw={spw:.1f}, spw_values={spw_values}, "
+        f"spw={spw:.1f}, spw_values={spw_values}, " 
         f"model_families={strategy.model_families}, "
         f"scoring={strategy.scoring_metric}, cv_folds={strategy.cv_folds}, "
         f"class_weight={strategy.class_weight}, subsample_override=[1.0]"

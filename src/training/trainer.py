@@ -278,6 +278,12 @@ class ModelTrainer:
                 mlflow.log_param("validation_samples", len(X_val))
 
                 # ── Build model with effective (possibly imbalance-adjusted) hyperparams ──
+                # XGBoost and LightGBM do not accept class_weight in their
+                # constructors — silently including it produces warnings or
+                # errors.  Strip it for those model families.
+                model_type_lower = config.model_type.lower()
+                if model_type_lower in ("xgboost", "lightgbm"):
+                    effective_hyperparams.pop("class_weight", None)
                 model: ModelProtocol = self.model_factory(effective_hyperparams)
 
                 # Cross-validation: use strategy's fold count when available,
@@ -297,11 +303,21 @@ class ModelTrainer:
                                 f"(minority count={min_minority})"
                             )
 
+                # sklearn has no "pr_auc" string alias — convert to
+                # average_precision (which IS PR-AUC) as a callable scorer.
+                cv_scoring = config.cv_scoring
+                if cv_scoring == "pr_auc":
+                    from sklearn.metrics import average_precision_score, make_scorer
+                    cv_scoring = make_scorer(
+                        average_precision_score,
+                        response_method="predict_proba",
+                    )
+
                 # cross_val_score sees BaseEstimator at runtime (duck typing)
                 cv_scores = cross_val_score(
                     model, X_train, y_train,
                     cv=effective_cv_folds,
-                    scoring=config.cv_scoring,
+                    scoring=cv_scoring,
                     n_jobs=-1,
                 )
 
@@ -363,6 +379,25 @@ class ModelTrainer:
                 if strategy is not None and strategy.fit_extras:
                     fit_kwargs.update(strategy.fit_extras)
 
+                # XGBoost 2.0+ and LightGBM 4.0+ moved early_stopping_rounds
+                # from .fit() to the constructor.  When it's present:
+                # 1. Remove it from fit_kwargs (it's not accepted there).
+                # 2. Add it to constructor params and rebuild the model.
+                # 3. Add eval_set to fit_kwargs (required for early stopping).
+                esr_value = fit_kwargs.pop("early_stopping_rounds", None)
+                if esr_value is not None:
+                    import inspect
+                    fit_sig = inspect.signature(model.fit)
+                    if "early_stopping_rounds" not in fit_sig.parameters:
+                        effective_hyperparams["early_stopping_rounds"] = esr_value
+                        model = self.model_factory(effective_hyperparams)
+                    else:
+                        # Old API (sklearn GradientBoosting) — put it back
+                        fit_kwargs["early_stopping_rounds"] = esr_value
+                    # Provide eval_set for models that need it (XGBoost, LightGBM)
+                    if "eval_set" not in fit_kwargs:
+                        fit_kwargs["eval_set"] = [(X_val, y_val)]
+
                 model.fit(X_train, y_train, **fit_kwargs)
 
                 # Validation metrics
@@ -381,6 +416,7 @@ class ModelTrainer:
                         
 
                 # Save model to MLflow (with signature)
+                signature = None  # ensure fallback path always has a binding
                 try:
                     from mlflow.models.signature import infer_signature
                     signature = infer_signature(X_train, model.predict(X_train))
@@ -400,7 +436,7 @@ class ModelTrainer:
                     mlflow.sklearn.log_model(
                         sk_model=model,
                         artifact_path="model",
-                        signature=signature if 'signature' in locals() else None,
+                        signature=signature,
                     )
                 # Stored artifacts at local path (for registry) - MLflow also has its own artifact storage    
                 artifact_base = f"/app/artifacts/training"
@@ -646,7 +682,9 @@ class ModelTrainer:
     def _save_preprocessing_artifact(
         self, model_id: str, version: str
     ) -> str:
-        artifact_dir = self.settings.registry_dir / self.settings.models_dir
+        # Save alongside the model artifact (same models_dir), not under
+        # registry_dir which would create an invalid nested path.
+        artifact_dir = self.settings.models_dir
         artifact_dir.mkdir(parents=True, exist_ok=True)
         path = artifact_dir / f"{model_id}_{version}_preprocessing.joblib"
         if self.preprocessing_fn:

@@ -262,8 +262,12 @@ class DatasetProfile:
                 problem_subtype = "binary"
                 recommended_scoring = "f1"
                 recommended_avg = "binary"
-                n_pos = int(value_counts.get(1, value_counts.min()))
-                n_neg = int(value_counts.get(0, value_counts.max()))
+                # Do NOT assume labels are 0/1 — use sorted counts so that
+                # minority = smallest count, majority = largest count,
+                # regardless of the actual label values (e.g. 2/3, yes/no).
+                sorted_counts = value_counts.sort_values()
+                n_pos = int(sorted_counts.iloc[0])   # minority class count
+                n_neg = int(sorted_counts.iloc[-1])  # majority class count
                 if n_pos > 0:
                     spw = float(n_neg / n_pos)
             else:

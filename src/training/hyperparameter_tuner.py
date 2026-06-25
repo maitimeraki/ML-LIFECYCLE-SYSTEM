@@ -1014,9 +1014,9 @@ class AutoTrainer:
         # multiclass targets, so select the averaging strategy from the profile.
         if primary_metric == "pr_auc":
             if profile.is_multiclass:
-                scoring = make_scorer(average_precision_score, needs_proba=True, average="macro")
+                scoring = make_scorer(average_precision_score, response_method="predict_proba", average="macro")
             else:
-                scoring = make_scorer(average_precision_score, needs_proba=True)
+                scoring = make_scorer(average_precision_score, response_method="predict_proba")
         else:
             scoring = primary_metric
 
@@ -1038,7 +1038,7 @@ class AutoTrainer:
             #   - single-element list [v]  → force this exact value
             #   - multi-element list [a, b, → replace the search space; Optuna
             #     samples from these strategy-specified candidates instead of
-            #     the base search space defaults
+            #     the base search space defaults  
             #   - scalar                  → force this exact value
             for key, value in overrides.items():
                 if isinstance(value, list) and len(value) == 1:
@@ -1208,9 +1208,9 @@ class AutoTrainer:
         # multiclass targets, so select the averaging strategy from the profile.
         if primary_metric == "pr_auc":
             if profile.is_multiclass:
-                scoring = make_scorer(average_precision_score, needs_proba=True, average="macro")
+                scoring = make_scorer(average_precision_score, response_method="predict_proba", average="macro")
             else:
-                scoring = make_scorer(average_precision_score, needs_proba=True)
+                scoring = make_scorer(average_precision_score, response_method="predict_proba")
         else:
             scoring = primary_metric
 
