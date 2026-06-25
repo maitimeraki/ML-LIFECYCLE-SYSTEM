@@ -67,6 +67,12 @@ class TrainingConfig:
     class_weight: Optional[str] = None  # "balanced", "balanced_subsample", or None
     scale_pos_weight: float = 1.0  # For XGBoost/LightGBM: neg/pos ratio
     strategy: Optional[Any] = None  # ImbalanceStrategy — set by AutoTrainer
+    # -- Phase 2: Advanced techniques -------------------------------------------
+    enable_feature_engineering: bool = False  # Add interaction/stat features
+    enable_calibration: bool = False          # Calibrate probabilities (binary)
+    enable_ensemble: bool = False             # BalancedBagging for extreme imb
+    feature_pipeline: Optional[list] = None    # Fitted (name, transformer) pairs
+    optimal_threshold: Optional[float] = None  # F1-optimal decision threshold
 
 
 @dataclass
@@ -277,6 +283,35 @@ class ModelTrainer:
                 mlflow.log_param("training_samples",   len(X_train))
                 mlflow.log_param("validation_samples", len(X_val))
 
+                # ── Feature Engineering (Phase 2) ───────────────────────────
+                # Add statistical and interaction features BEFORE model fitting.
+                # Pipeline is fit on X_train only (no leakage), then applied to both.
+                if config.enable_feature_engineering and strategy is not None:
+                    from src.training.feature_engineering import build_feature_pipeline
+                    try:
+                        import pandas as pd
+                        X_train_df = pd.DataFrame(X_train, columns=config.feature_columns)
+                        X_val_df = pd.DataFrame(X_val, columns=config.feature_columns)
+                        steps = build_feature_pipeline(
+                            n_features=X_train.shape[1],
+                            n_samples=X_train.shape[0],
+                            category=strategy.category,
+                        )
+                        for name, transformer in steps:
+                            X_train_df = transformer.fit_transform(X_train_df, y_train)
+                            X_val_df = transformer.transform(X_val_df)
+                        X_train = X_train_df.values
+                        X_val = X_val_df.values
+                        config.feature_pipeline = steps
+                        mlflow.log_param("feature_engineering", True)
+                        mlflow.log_param("n_features_after_fe", X_train.shape[1])
+                        logger.info(
+                            f"Feature engineering applied: {X_train.shape[1]} features "
+                            f"(from {len(config.feature_columns)}), steps={[s[0] for s in steps]}"
+                        )
+                    except Exception as e:
+                        logger.warning(f"Feature engineering failed, using raw features: {e}")
+
                 # ── Build model with effective (possibly imbalance-adjusted) hyperparams ──
                 # XGBoost and LightGBM do not accept class_weight in their
                 # constructors — silently including it produces warnings or
@@ -285,6 +320,22 @@ class ModelTrainer:
                 if model_type_lower in ("xgboost", "lightgbm"):
                     effective_hyperparams.pop("class_weight", None)
                 model: ModelProtocol = self.model_factory(effective_hyperparams)
+
+                # ── Ensemble Wrapper (Phase 2) ──────────────────────────────
+                # For extreme/severe imbalance, wrap base model with BalancedBagging.
+                # This trains multiple sub-models on balanced under-samples.
+                if config.enable_ensemble and strategy is not None:
+                    from src.training.ensemble import get_ensemble_for_category
+                    try:
+                        ensemble = get_ensemble_for_category(
+                            strategy.category, model, random_state=config.random_state
+                        )
+                        if ensemble is not None:
+                            model = ensemble
+                            mlflow.log_param("ensemble", True)
+                            logger.info(f"Ensemble wrapper applied: {type(ensemble).__name__}")
+                    except Exception as e:
+                        logger.warning(f"Ensemble wrapper failed, using single model: {e}")
 
                 # Cross-validation: use strategy's fold count when available,
                 # otherwise fall back to config with adaptive reduction
@@ -338,42 +389,55 @@ class ModelTrainer:
 
                 # Full training — use sample_weight for imbalanced data on
                 # models that support it (GradientBoosting, etc.)
+                #
+                # CRITICAL: Do NOT apply sample_weight if the model already
+                # has built-in imbalance handling (scale_pos_weight for XGB/LGB,
+                # class_weight for RF/GBM).  Applying both causes
+                # over-correction: the model predicts EVERYTHING as positive,
+                # giving recall=100% but precision=base_rate (disaster).
                 fit_kwargs: dict[str, Any] = {}
+                model_has_builtin_imbalance = (
+                    "scale_pos_weight" in effective_hyperparams
+                    or "class_weight" in effective_hyperparams
+                )
                 use_sw = (
-                    strategy is not None
-                    and strategy.use_sample_weight
-                    and y_train.nunique() == 2
-                ) or (
-                    strategy is None
-                    and config.is_imbalanced
+                    not model_has_builtin_imbalance
+                    and (
+                        (strategy is not None and strategy.use_sample_weight)
+                        or (strategy is None and config.is_imbalanced)
+                    )
                     and y_train.nunique() == 2
                 )
                 if use_sw:
                     n_total = len(y_train)
-                    n_pos = int((y_train == 1).sum())
-                    n_neg = n_total - n_pos
-                    # GradientBoosting requires >= 2 classes. If the fold
-                    # trimmed to a single class (possible with extreme
-                    # imbalance + aggressive weighting), skip sample_weight
-                    # and let the model fit on what's left.
-                    if n_pos > 0 and n_neg > 0:
+                    # Handle non-0/1 labels: minority class gets higher weight
+                    vc = y_train.value_counts()
+                    n_minority = int(vc.min())
+                    n_majority = int(vc.max())
+                    minority_label = vc.idxmin()
+                    if n_minority > 0 and n_majority > 0:
                         sample_weight = np.where(
-                            y_train == 1,
-                            n_total / (2.0 * n_pos),
-                            n_total / (2.0 * n_neg),
+                            y_train == minority_label,
+                            n_total / (2.0 * n_minority),
+                            n_total / (2.0 * n_majority),
                         )
                         fit_kwargs["sample_weight"] = sample_weight
                         logger.info(
                             f"Using sample_weight for imbalanced fit: "
-                            f"pos_weight={n_total/(2*n_pos):.2f}, "
-                            f"neg_weight={n_total/(2*n_neg):.2f}"
+                            f"minority_weight={n_total/(2*n_minority):.2f}, "
+                            f"majority_weight={n_total/(2*n_majority):.2f}"
                         )
                     else:
                         logger.warning(
                             f"Skipping sample_weight: fold has only "
-                            f"{'positives' if n_pos > 0 else 'negatives'} "
-                            f"(n_pos={n_pos}, n_neg={n_neg})."
+                            f"{'minority' if n_minority > 0 else 'majority'} "
+                            f"samples (n_minority={n_minority}, n_majority={n_majority})."
                         )
+                elif model_has_builtin_imbalance:
+                    logger.info(
+                        "Skipping sample_weight: model has builtin imbalance "
+                        "handling (scale_pos_weight or class_weight)."
+                    )
 
                 # Merge any extra fit kwargs from the strategy
                 if strategy is not None and strategy.fit_extras:
@@ -400,8 +464,59 @@ class ModelTrainer:
 
                 model.fit(X_train, y_train, **fit_kwargs)
 
+                # ── Probability Calibration (Phase 2) ───────────────────────
+                # Calibrate predicted probabilities using validation data.
+                # This improves threshold tuning and PR-AUC.
+                if (config.enable_calibration
+                    and hasattr(model, "predict_proba")
+                    and y_train.nunique() == 2):
+                    from src.training.calibration import calibrate_model
+                    try:
+                        calibrated = calibrate_model(model, X_val, y_val)
+                        if calibrated is not model:
+                            model = calibrated
+                            mlflow.log_param("calibration", True)
+                    except Exception as e:
+                        logger.warning(f"Calibration failed, using uncalibrated model: {e}")
+
+                # Threshold tuning for imbalanced classification.
+                # The default 0.5 threshold is almost never optimal when
+                # classes are imbalanced.  Scan over candidate thresholds
+                # on the validation set and pick the one that maximizes F1.
+                optimal_threshold = None
+                if (
+                    strategy is not None
+                    and strategy.is_classification
+                    and y_train.nunique() == 2
+                    and hasattr(model, "predict_proba")
+                ):
+                    try:
+                        from sklearn.metrics import f1_score
+                        y_prob_val = model.predict_proba(X_val)[:, 1]
+                        best_f1 = -1.0
+                        # Search thresholds from 0.05 to 0.95
+                        for t in np.arange(0.05, 0.96, 0.05):
+                            y_pred_t = (y_prob_val >= t).astype(int)
+                            f1_t = f1_score(y_val, y_pred_t, zero_division=0)
+                            if f1_t > best_f1:
+                                best_f1 = f1_t
+                                optimal_threshold = t
+                        if optimal_threshold is not None:
+                            mlflow.log_param(
+                                "optimal_threshold", optimal_threshold
+                            )
+                            logger.info(
+                                f"Optimal threshold: {optimal_threshold:.2f} "
+                                f"(val F1={best_f1:.4f})"
+                            )
+                    except Exception as e:
+                        logger.warning(f"Threshold tuning failed: {e}")
+
                 # Validation metrics
-                metrics = self._compute_metrics(model, X_val, y_val, config, strategy)
+                metrics = self._compute_metrics(
+                    model, X_val, y_val, config, strategy,
+                    threshold=optimal_threshold,
+                )
                 for metric_name, metric_value in metrics.items():
                     mlflow.log_metric(metric_name, metric_value)
 
@@ -420,13 +535,20 @@ class ModelTrainer:
                 try:
                     from mlflow.models.signature import infer_signature
                     signature = infer_signature(X_train, model.predict(X_train))
-                    model_info = mlflow.sklearn.log_model(model, artifact_path="model", signature=signature, registered_model_name=f"{model_id}",
-                    input_sample=X_train.head(5),
-                    metadata={
-                    "model_id": model_id, 
-                    "model_version": model_version,
-                    "cv_mean": str(cv_mean),
-                    "cv_std": str(cv_std),})
+                    # MLflow 3.x: use `name` instead of deprecated `artifact_path`,
+                    # and drop `input_sample` (no longer accepted).
+                    model_info = mlflow.sklearn.log_model(
+                        sk_model=model,
+                        name="model",
+                        signature=signature,
+                        registered_model_name=f"{model_id}",
+                        metadata={
+                            "model_id": model_id,
+                            "model_version": model_version,
+                            "cv_mean": str(cv_mean),
+                            "cv_std": str(cv_std),
+                        },
+                    )
                     # Log the model URI for easy retrieval
                     mlflow.set_tag("model_uri", model_info.model_uri)
                     logger.info(f"Model registered: {model_info.model_uri}")
@@ -583,14 +705,25 @@ class ModelTrainer:
         X_val: pd.DataFrame,
         y_val: pd.Series,
         config: TrainingConfig,
-        strategy
+        strategy,
+        threshold: Optional[float] = None,
     ) -> dict[str, float]:
-        from sklearn.metrics import (              
+        from sklearn.metrics import (
             accuracy_score, f1_score, precision_score, recall_score,
             roc_auc_score, mean_squared_error, mean_absolute_error, r2_score,
         )
 
-        y_pred  = model.predict(X_val)
+        # Use tuned threshold for binary classification if available.
+        # For imbalanced data, the default argmax (0.5) is suboptimal.
+        if (
+            threshold is not None
+            and hasattr(model, "predict_proba")
+            and y_val.nunique() == 2
+        ):
+            y_prob = model.predict_proba(X_val)[:, 1]
+            y_pred = (y_prob >= threshold).astype(int)
+        else:
+            y_pred = model.predict(X_val)
         metrics: dict[str, float] = {}
 
         is_classification = hasattr(model, "predict_proba") or y_val.nunique() <= 20
