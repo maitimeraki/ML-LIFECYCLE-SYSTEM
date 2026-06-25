@@ -153,14 +153,20 @@ def _build_extreme_imbalance(
             },
         },
         fit_extras={"early_stopping_rounds": 30},
+        # Phase 2: Enable advanced techniques for extreme imbalance
+        enable_feature_engineering=True,
+        enable_calibration=True,
+        enable_ensemble=True,
     )
 
     logger.info(
         f"_build_extreme_imbalance: strategy built — "
-        f"spw={spw:.1f}, spw_values={spw_values}, " 
+        f"spw={spw:.1f}, spw_values={spw_values}, "
         f"model_families={strategy.model_families}, "
         f"scoring={strategy.scoring_metric}, cv_folds={strategy.cv_folds}, "
-        f"class_weight={strategy.class_weight}, subsample_override=[1.0]"
+        f"class_weight={strategy.class_weight}, subsample_override=[1.0], "
+        f"fe={strategy.enable_feature_engineering}, cal={strategy.enable_calibration}, "
+        f"ens={strategy.enable_ensemble}"
     )
     return strategy
 
@@ -171,9 +177,10 @@ def _build_severe_imbalance(
     profile: DatasetProfile, n_trials: int,
 ) -> ImbalanceStrategy:
     spw = profile.scale_pos_weight
-    spw_low = max(1, int(spw * 0.9))
-    spw_high = int(spw * 1.1)
-    spw_values = sorted(set([spw_low, int(spw), spw_high]))
+    spw_low = max(1, int(spw * 0.5))
+    spw_high = int(spw * 1.2)
+    spw_sqrt = max(1, int(spw ** 0.5))
+    spw_values = sorted(set([spw_low, spw_sqrt, int(spw), spw_high]))
     spw_values = [v for v in spw_values if v >= 1]
 
     logger.debug(
@@ -205,6 +212,10 @@ def _build_severe_imbalance(
             },
         },
         fit_extras={"early_stopping_rounds": 20},
+        # Phase 2: Enable advanced techniques for severe imbalance
+        enable_feature_engineering=True,
+        enable_calibration=True,
+        enable_ensemble=True,
     )
 
     logger.info(
@@ -212,7 +223,9 @@ def _build_severe_imbalance(
         f"spw={spw:.1f}, spw_values={spw_values}, "
         f"model_families={strategy.model_families}, "
         f"scoring={strategy.scoring_metric}, cv_folds={strategy.cv_folds}, "
-        f"class_weight={strategy.class_weight}"
+        f"class_weight={strategy.class_weight}, "
+        f"fe={strategy.enable_feature_engineering}, cal={strategy.enable_calibration}, "
+        f"ens={strategy.enable_ensemble}"
     )
     return strategy
 
