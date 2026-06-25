@@ -342,8 +342,9 @@ class SearchSpace:
 
     @staticmethod
     def lightgbm(is_classification, is_imbalanced, n_samples):
-        # is_unbalanced param tells LightGBM to handle class imbalance
-        unbal_values = [True, False] if is_imbalanced else [False]
+        # LightGBM 4.6+ sklearn API does not support `is_unbalanced`.
+        # Imbalance is handled via `scale_pos_weight` (set by the strategy
+        # factory's search_space_overrides) or `class_weight` (native sklearn).
         sklearn_space = {
             "n_estimators": [100, 200, 300, 500],
             "num_leaves": [15, 31, 63, 127],
@@ -354,11 +355,10 @@ class SearchSpace:
             "reg_alpha": loguniform(1e-4, 10),
             "reg_lambda": loguniform(1e-4, 10),
             "min_child_samples": randint(5, 50),
-            "is_unbalanced": unbal_values if is_imbalanced else [False],
         }
 
         def optuna_space(trial):
-            params = {
+            return {
                 "n_estimators": trial.suggest_categorical("n_estimators", [100, 200, 300, 500]),
                 "num_leaves": trial.suggest_categorical("num_leaves", [15, 31, 63, 127]),
                 "max_depth": trial.suggest_categorical("max_depth", [-1, 5, 10, 15, 20]),
@@ -369,11 +369,6 @@ class SearchSpace:
                 "reg_lambda": trial.suggest_float("reg_lambda", 1e-4, 10.0, log=True),
                 "min_child_samples": trial.suggest_int("min_child_samples", 5, 50),
             }
-            if is_imbalanced:
-                params["is_unbalanced"] = trial.suggest_categorical(
-                    "is_unbalanced", [True, False]
-                )
-            return params
 
         return sklearn_space, optuna_space
 
@@ -433,13 +428,15 @@ class SearchSpace:
         return sklearn_space, optuna_space
 
     @staticmethod
-    def _safe_model_params(model_cls, params, random_state):
+    def _safe_model_params(model_cls, params: Dict[Any,Any], random_state: int) -> Dict[str, Any]:
         """Filter params to only those accepted by the model class.
         Handles models like GradientBoosting that don't accept n_jobs."""
         import inspect
         sig = inspect.signature(model_cls.__init__)
         valid_params = set(sig.parameters.keys())
         safe = {"random_state": random_state}
+        if params is None:
+            return safe
         for k, v in params.items():
             if k in valid_params and v is not None:
                 safe[k] = v
@@ -902,7 +899,7 @@ class AutoTrainer:
                 f"[{family}] Override details: {overrides}"
             )
         else:
-            logger.debug(f"[{family}] No strategy overrides applied")
+            logger.warning(f"[{family}] No strategy overrides applied")
 
         search_strategy = tuning_config.search_strategy
         if search_strategy == "auto":
@@ -969,7 +966,6 @@ class AutoTrainer:
 
         X = df[config.feature_columns].values
         y = df[config.target_column].values
-        y = np.asarray(y) # ->
 
         logger.debug(
             f"[{family}] Input data: X.shape={X.shape}, y.shape={y.shape}, "
@@ -979,7 +975,7 @@ class AutoTrainer:
         label_encoder = None
         if profile.is_classification and y.dtype == object:
             label_encoder = LabelEncoder()
-            y = label_encoder.fit_transform(y)
+            y = label_encoder.fit_transform(np.asarray(y))
 
         factory_info = MODEL_FACTORIES[family]
         model_cls = factory_info["classifier"] if profile.is_classification else factory_info["regressor"]
@@ -991,16 +987,36 @@ class AutoTrainer:
                 error_message=f"{family} does not support this problem type",
             )
 
-        # Use strategy's CV fold count (reduced for extreme imbalance)
+        # Use strategy's CV fold count, but reduce when the minority class
+        # is too small for stratified folds to contain positives in every fold.
+        # Floor at 2 — 1-fold is not cross-validation.
+        if y is None or len(np.asarray(y)) == 0:
+            raise HyperparameterTuningError(
+                f"[{family}] Target variable is empty or None.",
+                details={"y": y}
+            )
         cv_folds = strategy.cv_folds
         if profile.is_classification:
+            minority_count = int(y.value_counts().min()) if hasattr(y, "value_counts") else len(np.asarray(y))
+            max_feasible_folds = max(2, minority_count // 2)
+            if cv_folds > max_feasible_folds:
+                logger.info(
+                    f"[{family}] Reducing CV folds from {cv_folds} to "
+                    f"{max_feasible_folds} (minority_count={minority_count})"
+                )
+                cv_folds = max_feasible_folds
             cv = StratifiedKFold(n_splits=cv_folds, shuffle=True, random_state=tuning_config.random_state)
         else:
             cv = KFold(n_splits=cv_folds, shuffle=True, random_state=tuning_config.random_state)
 
-        # sklearn has no "pr_auc" string alias — convert to a callable scorer
+        # sklearn has no "pr_auc" string alias — convert to a callable scorer.
+        # average_precision_score defaults to average='binary' which raises on
+        # multiclass targets, so select the averaging strategy from the profile.
         if primary_metric == "pr_auc":
-            scoring = make_scorer(average_precision_score, needs_proba=True)
+            if profile.is_multiclass:
+                scoring = make_scorer(average_precision_score, needs_proba=True, average="macro")
+            else:
+                scoring = make_scorer(average_precision_score, needs_proba=True)
         else:
             scoring = primary_metric
 
@@ -1016,13 +1032,26 @@ class AutoTrainer:
             params = optuna_space_fn(trial)
             params = {k: v for k, v in params.items() if v is not None}
 
-            # Apply strategy overrides (e.g., force class_weight for extreme imbalance)
+            # Apply strategy overrides (e.g., force class_weight for extreme imbalance).
+            #
+            # Override value shapes:
+            #   - single-element list [v]  → force this exact value
+            #   - multi-element list [a, b, → replace the search space; Optuna
+            #     samples from these strategy-specified candidates instead of
+            #     the base search space defaults
+            #   - scalar                  → force this exact value
             for key, value in overrides.items():
-                if key not in params:
-                    params[key] = value
-                elif isinstance(value, list) and len(value) == 1:
-                    # Single-value override forces the param
+                if isinstance(value, list) and len(value) == 1:
+                    # Single-value override forces the param (unwrap list)
                     params[key] = value[0]
+                elif isinstance(value, list) and len(value) > 1:
+                    # Multi-value override: the strategy is narrowing the
+                    # search space to specific candidates.  Replace the
+                    # Optuna-sampled value with a strategy value (cycle by
+                    # trial number so different trials explore different
+                    # candidates).
+                    override_idx = trial.number % len(value)
+                    params[key] = value[override_idx]
 
             try:
                 safe_params = SearchSpace._safe_model_params(
@@ -1039,8 +1068,11 @@ class AutoTrainer:
                 # positive samples. Use nanmean so a single nan fold doesn't
                 # poison the whole trial's mean.
                 if np.all(np.isnan(scores)):
-                    mean_score = -np.nan
-                    std_score = float("nan")
+                    # All folds degenerate (no positives). Use a finite
+                    # sentinel so the pruner can distinguish this from a
+                    # crashed trial — -np.nan is still nan and gets pruned.
+                    mean_score = 0.0
+                    std_score = 0.0
                 else:
                     mean_score = float(np.nanmean(scores))
                     std_score = float(np.nanstd(scores))
@@ -1052,11 +1084,13 @@ class AutoTrainer:
 
                 secondary = {}
                 if tuning_config.use_multi_objective and profile.is_classification:
-                    train_idx, val_idx = list(cv.split(X, y))[:1]
+                    # 1. Get the first fold tuple directly without indexing a slice
+                    X_arr, y_arr = np.asarray(X), np.asarray(y)
+                    train_idx, val_idx = next(cv.split(X_arr, y_arr))
                     model_clone = clone(model)
-                    model_clone.fit(X[train_idx], y[train_idx])
-                    y_pred = model_clone.predict(X[val_idx])
-                    y_true = y[val_idx]
+                    model_clone.fit(X_arr[train_idx], y_arr[train_idx])
+                    y_pred = model_clone.predict(X_arr[val_idx])
+                    y_true = y_arr[val_idx]
                     # Use profile's recommended average (binary for binary, macro for multiclass)
                     avg = profile.recommended_average
                     secondary["precision"] = float(precision_score(y_true, y_pred, average=avg, zero_division=0))
@@ -1089,7 +1123,9 @@ class AutoTrainer:
             except optuna.TrialPruned:
                 raise
             except Exception as e:
-                logger.debug(f"Optuna trial {trial.number} failed: {e}")
+                logger.warning(
+                    f"Optuna trial {trial.number} failed ({type(e).__name__}): {e}"
+                )
                 if HYPERPARAMETER_TRIALS_TOTAL:
                     HYPERPARAMETER_TRIALS_TOTAL.labels(
                         model_id=self.model_id, model_family=family, status="failed"
@@ -1112,7 +1148,7 @@ class AutoTrainer:
         study.optimize(
             objective, n_trials=tuning_config.n_trials,
             timeout=tuning_config.timeout_seconds,
-            show_progress_bar=False, catch=(Exception,),
+            show_progress_bar=False,
         )
 
         logger.info(
@@ -1167,9 +1203,14 @@ class AutoTrainer:
                 error_message=f"{family} does not support this problem type",
             )
 
-        # sklearn has no "pr_auc" string alias — convert to a callable scorer
+        # sklearn has no "pr_auc" string alias — convert to a callable scorer.
+        # average_precision_score defaults to average='binary' which raises on
+        # multiclass targets, so select the averaging strategy from the profile.
         if primary_metric == "pr_auc":
-            scoring = make_scorer(average_precision_score, needs_proba=True)
+            if profile.is_multiclass:
+                scoring = make_scorer(average_precision_score, needs_proba=True, average="macro")
+            else:
+                scoring = make_scorer(average_precision_score, needs_proba=True)
         else:
             scoring = primary_metric
 
@@ -1182,7 +1223,6 @@ class AutoTrainer:
             if k in valid_params
             and not (k == "class_weight" and not profile.is_classification)
             and not (k == "scale_pos_weight" and "scale_pos_weight" not in valid_params)
-            and not (k == "is_unbalanced" and "is_unbalanced" not in valid_params)
         }
         n_iter = min(tuning_config.n_trials, 30)
 

@@ -105,7 +105,15 @@ def _build_extreme_imbalance(
         is_unbalanced_lgbm=True,
         search_space_overrides={
             "xgboost": {"scale_pos_weight": spw_values},
-            "lightgbm": {"is_unbalanced": [True]},
+            "lightgbm": {
+                # LightGBM 4.6+ does not support `is_unbalanced`; use
+                # `scale_pos_weight` instead (native LightGBM param).
+                "scale_pos_weight": spw_values,
+                # Extreme imbalance + default min_child_samples=20 means trees
+                # stop after 1-2 splits (the minority group is < 20 samples).
+                # Lower it so leaves can split on small minority clusters.
+                "min_child_samples": [5, 10],
+            },
             "random_forest": {"class_weight": ["balanced_subsample"]},
             "gradient_boosting": {"subsample": [1.0]},
             "logistic_regression": {
@@ -156,7 +164,7 @@ def _build_severe_imbalance(
         is_unbalanced_lgbm=True,
         search_space_overrides={
             "xgboost": {"scale_pos_weight": spw_values},
-            "lightgbm": {"is_unbalanced": [True]},
+            "lightgbm": {"scale_pos_weight": spw_values},
             "random_forest": {
                 "class_weight": ["balanced_subsample", "balanced"],
             },
@@ -198,7 +206,7 @@ def _build_moderate_imbalance(
         is_unbalanced_lgbm=False,
         search_space_overrides={
             "xgboost": {"scale_pos_weight": [1, 2, 5]},
-            "lightgbm": {"is_unbalanced": [False, True]},
+            "lightgbm": {"scale_pos_weight": [1, 2, 5]},
             "random_forest": {"class_weight": ["balanced", None]},
             "logistic_regression": {
                 "class_weight": ["balanced", None],

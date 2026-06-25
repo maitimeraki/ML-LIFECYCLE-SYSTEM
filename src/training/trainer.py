@@ -305,8 +305,12 @@ class ModelTrainer:
                     n_jobs=-1,
                 )
 
-                cv_mean = float(np.mean(cv_scores))
-                cv_std  = float(np.std(cv_scores))
+                # Degenerate folds (no positives) produce nan scores.  Use
+                # errstate to suppress the noisy All-NaN slice warning; the
+                # nanmean path below handles them numerically.
+                with np.errstate(invalid="ignore", divide="ignore"):
+                    cv_mean = float(np.nanmean(cv_scores))
+                    cv_std  = float(np.nanstd(cv_scores))
 
                 mlflow.log_metric("cv_mean", cv_mean)
                 mlflow.log_metric("cv_std",  cv_std)
