@@ -13,3 +13,6 @@ psycopg2-binary>=2.9.9
 httpx==0.28.1
 asyncpg>=0.30.0
 kubernetes==36.0.0
+optuna==4.9.0
+xgboost==3.2.0
+lightgbm==4.6.0
