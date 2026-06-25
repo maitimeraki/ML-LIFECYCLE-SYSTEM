@@ -59,6 +59,10 @@ class ImbalanceStrategy:
     is_unbalanced_lgbm: bool = False
     search_space_overrides: dict[str, dict[str, Any]] = field(default_factory=dict)
     fit_extras: dict[str, Any] = field(default_factory=dict)
+    # -- Phase 2: Advanced techniques -------------------------------------------
+    enable_feature_engineering: bool = False  # Add interaction/statistical features
+    enable_calibration: bool = False          # Calibrate probabilities (binary)
+    enable_ensemble: bool = False             # BalancedBagging for extreme imb
 
     # -- Convenience properties ------------------------------------------------
 
